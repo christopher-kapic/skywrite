@@ -11,3 +11,5 @@
 A saved skill is a procedural document. Reading it never runs commands or starts model calls. Generation/upscaling availability is determined by the installed CLI help; this outline does not promise a particular backend.
 
 A mixed workflow uses `image render` for typography, `generate image --reference` for a character pose, `generate video --first-frame` for motion, then `jobs resume` to retrieve it. Place graphics and generated clips together in edit JSON. AI video upscaling uses `upscale video --source-job JOB_ID`; local image resizing uses `upscale image INPUT --output OUTPUT.png` and is non-AI. Retain job IDs/provenance to resume rather than re-spend.
+
+A local MP4 may be hosted through the user's explicitly configured public S3/R2 bucket with `skywrite upscale video FILE --upload`. Optional `--delete-upload-after` waits for a verified completed result; pending or uncertain jobs retain the source. `skywrite storage purge --dry-run` previews marked uploads in the configured prefix. Live bucket compatibility is intentionally left to the user.

@@ -161,7 +161,28 @@ fn store_child() {
             assert_eq!(list["items"][0]["name"], "alpha");
             assert!(list["items"][0].get("content").is_none());
             assert_eq!(list["items"][2]["name"], "z_style");
-            assert_eq!(workspace::execute_content(ContentKind::Skills,ContentCommand::List).unwrap()["items"].as_array().unwrap().len(),8);
+            let builtins =
+                workspace::execute_content(ContentKind::Skills, ContentCommand::List).unwrap();
+            let names: Vec<_> = builtins["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    "character-reference",
+                    "composing-tools",
+                    "fcpxml",
+                    "ffmpeg",
+                    "hyperframes",
+                    "remotion",
+                    "synchronization",
+                    "takumi",
+                    "technical-explainer"
+                ]
+            );
             assert_eq!(
                 read(ContentKind::Skills, "ffmpeg").unwrap()["origin"],
                 "builtin"

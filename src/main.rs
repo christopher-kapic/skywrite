@@ -10,7 +10,7 @@ use std::time::Duration;
     name = "skywrite",
     version,
     about = "Agent-friendly media understanding, synchronization, and editing",
-    after_help = "All successful commands emit JSON to stdout. Diagnostics go to stderr. Agents: save ALL frustrations, bugs, and missing features with skywrite nit <description>. Run skywrite schema for edit/transcript examples. Compose tools: render HTML graphics as image clips in FCPXML/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation."
+    after_help = "Run skywrite init for offline starter preferences and skywrite defaults image to inspect a task. All successful commands emit JSON to stdout. Diagnostics go to stderr. Agents: save ALL frustrations, bugs, and missing features with skywrite nit <description>. Run skywrite schema for edit/transcript examples. Compose tools: render HTML graphics as image clips in FCPXML/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,6 +44,11 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
+    /// Inspect or set effective task model defaults.
+    #[command(alias = "default")]
+    Defaults(skywrite::config_cli::DefaultsArgs),
+    /// Create offline starter configuration without replacing preferences.
+    Init(skywrite::config_cli::InitArgs),
     /// Save/read reusable creative prompts in ~/.skywrite/styles.
     Styles {
         #[command(subcommand)]
@@ -56,7 +61,7 @@ enum Command {
     },
     /// Save ALL agent frustrations in ~/.skywrite/nits (never uploads).
     Nit { description: String },
-    /// Generate images/videos, with reference inputs and durable paid-job records.
+    /// Generate images, videos, narrated speech, or music with durable job records.
     Generate {
         #[command(subcommand)]
         command: skywrite::generation::GenerateCommand,
@@ -70,6 +75,16 @@ enum Command {
     Upscale {
         #[command(subcommand)]
         command: skywrite::generation::UpscaleCommand,
+    },
+    /// Configure public S3/R2 uploads and purge only Skywrite upload objects.
+    Storage {
+        #[command(subcommand)]
+        command: skywrite::storage::StorageCommand,
+    },
+    /// Share and discover finished assets across machines using S3/R2.
+    Outputs {
+        #[command(subcommand)]
+        command: skywrite::outputs::OutputsCommand,
     },
     /// Print agent-facing edit and transcript schemas/examples.
     Schema,
@@ -243,7 +258,7 @@ enum ImageCommand {
 enum ModelCommand {
     /// List capabilities and prices from free cached OpenRouter catalogs.
     List {
-        #[arg(long,value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        #[arg(long,value_parser=skywrite::models::task_parser())]
         task: Option<String>,
         #[arg(long)]
         input: Option<String>,
@@ -262,13 +277,13 @@ enum ModelCommand {
     Defaults,
     /// Save an explicit model ID; does not call or pay for the model.
     SetDefault {
-        #[arg(value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        #[arg(value_parser=skywrite::models::task_parser())]
         task: String,
         model: String,
     },
     /// Remove a saved task model default without making a paid request.
     UnsetDefault {
-        #[arg(value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        #[arg(value_parser=skywrite::models::task_parser())]
         task: String,
     },
 }
@@ -331,6 +346,10 @@ fn finish(value: Value, output: &OutputOptions) -> Result<Value> {
 }
 fn execute(command: Command) -> Result<Value> {
     match command {
+        Command::Storage { command } => skywrite::storage::execute(command),
+        Command::Outputs { command } => skywrite::outputs::execute(command),
+        Command::Defaults(args) => skywrite::config_cli::execute_defaults(args),
+        Command::Init(args) => skywrite::config_cli::initialize(args),
         Command::Generate { command } => skywrite::generation::execute_generate(command),
         Command::Jobs { command } => skywrite::generation::execute_jobs(command),
         Command::Upscale { command } => skywrite::generation::execute_upscale(command),

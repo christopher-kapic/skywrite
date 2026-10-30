@@ -6,7 +6,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BASE: &str = "https://openrouter.ai/api/v1";
@@ -81,6 +81,10 @@ pub struct VideoArgs {
 pub enum GenerateCommand {
     Image(ImageArgs),
     Video(VideoArgs),
+    /// Generate narrated speech through OpenRouter.
+    Speech(crate::audio_generation::SpeechArgs),
+    /// Generate original music through an audio-output model.
+    Music(crate::audio_generation::MusicArgs),
 }
 #[derive(Debug, Args)]
 pub struct VideoUpscaleArgs {
@@ -90,9 +94,15 @@ pub struct VideoUpscaleArgs {
     /// Completed Skywrite video job; obtains a fresh signed OpenRouter content URL.
     #[arg(long, conflicts_with = "source_url")]
     pub source_job: Option<String>,
-    /// Public HTTPS source you host. Skywrite never uploads videos to a public host.
+    /// Public HTTPS source you host; alternatively opt into the configured S3/R2 uploader.
     #[arg(long, conflicts_with = "source_job")]
     pub source_url: Option<String>,
+    /// Upload/reuse the local MP4 in the explicitly configured public S3/R2 bucket.
+    #[arg(long, conflicts_with_all=["source_job", "source_url"])]
+    pub upload: bool,
+    /// Remove the uploaded source after a verified completed result; resume retries cleanup.
+    #[arg(long, requires = "upload")]
+    pub delete_upload_after: bool,
     #[arg(long, default_value_t = 2.0)]
     pub factor: f64,
     /// 0 precise, 1 creative. Creative processing may invent details.
@@ -149,6 +159,9 @@ struct Artifact {
     sha256: String,
     media_type: String,
     bytes: u64,
+    /// Set only after this version actually decodes these hash-identified bytes.
+    #[serde(default)]
+    decode_validation_version: u32,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Job {
@@ -166,6 +179,8 @@ struct Job {
     usage: Option<Value>,
     artifact: Option<Artifact>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_text: Option<String>,
 }
 fn timestamp() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
@@ -250,7 +265,11 @@ fn load_job(dir: &Path) -> Result<Job> {
     }
     if !matches!(
         job.task.as_str(),
-        "image-generation" | "video-generation" | "video-upscaling"
+        "image-generation"
+            | "video-generation"
+            | "video-upscaling"
+            | "speech-generation"
+            | "music-generation"
     ) {
         bail!("invalid generation task");
     }
@@ -295,9 +314,21 @@ fn save_job(dir: &Path, job: &mut Job) -> Result<()> {
 fn artifact_path(dir: &Path, a: &Artifact) -> Result<PathBuf> {
     if !matches!(
         a.file.as_str(),
-        "result.png" | "result.jpg" | "result.webp" | "result.mp4"
+        "result.png" | "result.jpg" | "result.webp" | "result.mp4" | "result.mp3" | "result.wav"
     ) {
         bail!("invalid job artifact name");
+    }
+    let expected_mime = match a.file.as_str() {
+        "result.png" => "image/png",
+        "result.jpg" => "image/jpeg",
+        "result.webp" => "image/webp",
+        "result.mp4" => "video/mp4",
+        "result.mp3" => "audio/mpeg",
+        "result.wav" => "audio/wav",
+        _ => unreachable!(),
+    };
+    if a.media_type != expected_mime {
+        bail!("job artifact filename disagrees with MIME metadata");
     }
     let path = dir.join(&a.file);
     let f = open_regular(&path, false)?;
@@ -305,6 +336,105 @@ fn artifact_path(dir: &Path, a: &Artifact) -> Result<PathBuf> {
         bail!("job artifact integrity check failed");
     }
     Ok(path)
+}
+
+/// Actual consumers verify legacy artifacts, while read-only job metadata does
+/// not repeatedly decode completed videos. The hash binds the decode marker to
+/// unchanged bytes in this user-owned job store.
+fn verified_artifact_path(dir: &Path, artifact: &Artifact) -> Result<PathBuf> {
+    let path = artifact_path(dir, artifact)?;
+    if artifact.decode_validation_version != 1 {
+        if is_audio_task_mime(&artifact.media_type) {
+            crate::audio_generation::validate_audio(&path, &artifact.media_type)?;
+        } else {
+            validate_generated_media(&path, &artifact.media_type)?;
+        }
+    }
+    Ok(path)
+}
+
+/// Decode the actual primary media, rather than trusting container headers.
+/// This is also used for cached artifacts, so a result accepted by an older
+/// version cannot bypass validation through a same-format copy.
+fn validate_generated_media(path: &Path, media_type: &str) -> Result<()> {
+    let video = media_type == "video/mp4";
+    if video {
+        if open_regular(path, false)?.metadata()?.len() > MAX_VIDEO {
+            bail!("video result exceeds 512 MiB");
+        }
+        let media = crate::media::probe(path)?;
+        if !media.has_video()
+            || !media
+                .format_name
+                .split(',')
+                .any(|s| matches!(s, "mov" | "mp4"))
+            || media.video().is_none_or(|stream| {
+                stream.width.unwrap_or(0) == 0
+                    || stream.height.unwrap_or(0) == 0
+                    || u64::from(stream.width.unwrap_or(0)) * u64::from(stream.height.unwrap_or(0))
+                        > MAX_PIXELS
+            })
+        {
+            bail!("video result must be MP4 with valid dimensions up to 64 megapixels");
+        }
+    } else {
+        if !matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
+            bail!("unsupported generated artifact MIME type");
+        }
+        let bytes = limited(open_regular(path, false)?, MAX_IMAGE)?;
+        let (actual, _) = image_type(&bytes)?;
+        let dimensions = imagesize::blob_size(&bytes)?;
+        if actual != media_type
+            || dimensions.width == 0
+            || dimensions.height == 0
+            || (dimensions.width as u64).saturating_mul(dimensions.height as u64) > MAX_PIXELS
+        {
+            bail!("image result MIME or dimensions are invalid");
+        }
+    }
+    let mut args = crate::process::args(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-xerror",
+        "-err_detect",
+        "explode",
+        "-threads",
+        "1",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+    ]);
+    args.push(path.as_os_str().to_owned());
+    args.extend(crate::process::args(&["-map", "0:v:0"]));
+    if video {
+        args.extend(crate::process::args(&["-map", "0:a:0?"]));
+    } else {
+        args.extend(crate::process::args(&["-frames:v", "1", "-an"]));
+    }
+    args.extend(crate::process::args(&[
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-f",
+        "null",
+        "-",
+    ]));
+    let decoded = crate::process::run(
+        "ffmpeg",
+        &args,
+        Duration::from_secs(if video { 180 } else { 30 }),
+        1024 * 1024,
+    )
+    .context("generated media failed decode validation")?;
+    if !String::from_utf8_lossy(&decoded.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("frame="))
+        .any(|value| value.trim().parse::<u64>().is_ok_and(|frames| frames > 0))
+    {
+        bail!("generated media failed decode validation: no video frame decoded");
+    }
+    Ok(())
 }
 fn public_job(dir: &Path, job: &Job) -> Result<Value> {
     let mut out = serde_json::to_value(job)?;
@@ -354,21 +484,21 @@ impl Transport {
             .build()?)
     }
     fn diagnostic(&self, raw: &str, body: Option<&Value>) -> String {
-        let mut message = raw.replace(&self.key, "<redacted API key>");
+        let mut message = raw.to_owned();
         if let Some(body) = body {
-            for field in ["input_references", "frame_images"] {
-                if let Some(items) = body[field].as_array() {
-                    for item in items {
-                        for kind in ["image_url", "video_url"] {
-                            if let Some(url) = item[kind]["url"].as_str() {
-                                message = message.replace(url, "<redacted reference URL>");
-                            }
-                        }
-                    }
+            let mut urls = Vec::new();
+            collect_reference_urls(body, &mut urls);
+            for url in urls {
+                if !url.is_empty() {
+                    message = message.replace(url, "<redacted reference URL>");
                 }
             }
         }
-        message.chars().take(2048).collect()
+        message
+            .replace(&self.key, "<redacted API key>")
+            .chars()
+            .take(2048)
+            .collect()
     }
     fn json(&self, path: &str, body: Option<&Value>) -> Result<Value> {
         let url = format!("{}{path}", self.base);
@@ -594,21 +724,52 @@ fn video_enum(
     body[key] = value;
     Ok(())
 }
+fn collect_reference_urls<'a>(value: &'a Value, urls: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "image_url" | "video_url")
+                    && let Some(url) = value["url"].as_str()
+                {
+                    urls.push(url);
+                }
+                collect_reference_urls(value, urls);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_reference_urls(value, urls);
+            }
+        }
+        _ => {}
+    }
+}
 fn sanitized_request(body: &Value) -> Value {
-    let mut value = body.clone();
-    for key in ["input_references", "frame_images"] {
-        if let Some(array) = value[key].as_array_mut() {
-            for item in array {
-                for field in ["image_url", "video_url"] {
-                    if !item[field].is_null() {
-                        item[field]["url"] = json!("<content-addressed local reference>");
+    fn hide(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "image_url" | "video_url") && value["url"].is_string()
+                    {
+                        value["url"] = json!("<content-addressed local reference>");
+                    } else {
+                        hide(value);
                     }
                 }
             }
+            Value::Array(values) => {
+                for value in values {
+                    hide(value);
+                }
+            }
+            _ => {}
         }
     }
+    let mut value = body.clone();
+    hide(&mut value);
     value
 }
+
 struct Prepared {
     task: String,
     model: String,
@@ -619,6 +780,8 @@ struct Prepared {
 }
 pub fn execute_generate(command: GenerateCommand) -> Result<Value> {
     let prepared = match command {
+        GenerateCommand::Speech(args) => return crate::audio_generation::speech(args),
+        GenerateCommand::Music(args) => return crate::audio_generation::music(args),
         GenerateCommand::Image(args) => {
             prompt_check(&args.prompt)?;
             let model =
@@ -814,8 +977,8 @@ fn validate_output(output: Option<&Path>, inputs: &[Value], overwrite: bool) -> 
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
-        if !["png", "jpg", "jpeg", "webp", "mp4"].contains(&extension.as_str()) {
-            bail!("output must have PNG/JPEG/WebP/MP4 extension");
+        if !["png", "jpg", "jpeg", "webp", "mp4", "mp3", "wav"].contains(&extension.as_str()) {
+            bail!("output must have PNG/JPEG/WebP/MP4/MP3/WAV extension");
         }
     }
     Ok(())
@@ -824,6 +987,13 @@ fn submit(prepared: Prepared) -> Result<Value> {
     submit_with(prepared, None)
 }
 fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Value> {
+    submit_with_upload(prepared, transport, None)
+}
+fn submit_with_upload(
+    prepared: Prepared,
+    transport: Option<&Transport>,
+    upload: Option<crate::storage::UploadPlan>,
+) -> Result<Value> {
     let Prepared {
         task,
         model,
@@ -839,11 +1009,17 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
     }
     validate_output(common.output.as_deref(), &references, common.overwrite)?;
     if let Some(output) = &common.output {
-        let is_mp4 = output
+        let ext = output
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
-        if is_mp4 != (task != "image-generation") {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let compatible = match task.as_str() {
+            "image-generation" => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp"),
+            "speech-generation" | "music-generation" => matches!(ext.as_str(), "mp3" | "wav"),
+            _ => ext == "mp4",
+        };
+        if !compatible {
             bail!("output extension does not match requested media kind");
         }
     }
@@ -872,6 +1048,10 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
             json!({"dry_run":true,"id":id,"task":task,"model":model,"request":request,"references":references,"paid_request":false,"note":"Pricing comes from selected model catalog/endpoint; this preview is not a quote."}),
         );
     }
+    let requested_cleanup = references
+        .first()
+        .and_then(|r| r["cleanup_requested"].as_bool())
+        .unwrap_or(false);
     let (dir, _lock) = locked_job(&id)?;
     let mut job = if dir.join("job.json").exists() {
         load_job(&dir)?
@@ -892,10 +1072,29 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
             usage: None,
             artifact: None,
             error: None,
+            output_text: None,
         };
         save_job(&dir, &mut job)?;
         job
     };
+    // A later explicit cleanup request may strengthen this same upload's policy.
+    if let Some(plan) = &upload {
+        let mut changed = false;
+        if requested_cleanup
+            && let Some(reference) = job.references.first_mut()
+            && reference["storage_upload"] == serde_json::to_value(&plan.record)?
+            && reference["cleanup_requested"] != true
+        {
+            reference["cleanup_requested"] = json!(true);
+            if reference["cleanup_status"] != "deleted" {
+                reference["cleanup_status"] = json!("pending");
+            }
+            changed = true;
+        }
+        if changed {
+            save_job(&dir, &mut job)?;
+        }
+    }
     if job.status == "prepared" {
         let owned;
         let transport = match transport {
@@ -905,18 +1104,17 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
                 &owned
             }
         };
+        // No remote storage work for completed, active, or uncertain jobs. Intent
+        // already exists on disk before uploading, and before the paid POST.
+        if let Some(plan) = &upload {
+            let _storage_lock = crate::storage::operation_lock()?;
+            crate::storage::ensure_uploaded(plan)?;
+        }
         job.status = "submitting".into();
         save_job(&dir, &mut job)?;
-        match transport.json(
-            if job.task == "image-generation" {
-                "/images"
-            } else {
-                "/videos"
-            },
-            Some(&body),
-        ) {
+        match transport.generated_response(&job.task, &body, &dir) {
             Ok(response) => {
-                if job.task == "image-generation" {
+                if is_synchronous_task(&job.task) {
                     crate::io::atomic_write(
                         &dir.join("response.json"),
                         &serde_json::to_vec(&response)?,
@@ -925,7 +1123,7 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
                     job.usage = response.get("usage").cloned();
                     job.status = "received".into();
                     save_job(&dir, &mut job)?;
-                    complete_image(&dir, &mut job, &response)?;
+                    complete_synchronous(&dir, &mut job, &response)?;
                 } else {
                     let remote = response["id"]
                         .as_str()
@@ -938,6 +1136,7 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
                 }
             }
             Err(error) => {
+                recover_audio_generation_id(&dir, &mut job)?;
                 let rejected = error.downcast_ref::<HttpRejection>().is_some_and(|e| {
                     matches!(e.status, 400 | 401 | 402 | 403 | 404 | 413 | 422 | 429)
                 });
@@ -957,13 +1156,14 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
         }
     }
     if job.status == "submitting"
-        && job.task == "image-generation"
+        && is_synchronous_task(&job.task)
         && dir.join("response.json").is_file()
     {
         job.status = "received".into();
         save_job(&dir, &mut job)?;
     }
     if job.status == "submitting" {
+        recover_audio_generation_id(&dir, &mut job)?;
         job.status = "uncertain".into();
         job.error=Some("Previous process stopped during submission. Check OpenRouter activity before intentionally creating a new take; adopt known video ID with jobs resume --remote-id.".into());
         save_job(&dir, &mut job)?;
@@ -973,7 +1173,7 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
             open_regular(&dir.join("response.json"), false)?,
             MAX_JSON,
         )?)?;
-        complete_image(&dir, &mut job, &response)?;
+        complete_synchronous(&dir, &mut job, &response)?;
     }
     if job.remote_id.is_some() && job.status != "completed" && job.status != "failed" {
         let owned;
@@ -986,6 +1186,7 @@ fn submit_with(prepared: Prepared, transport: Option<&Transport>) -> Result<Valu
         };
         refresh_video(&dir, &mut job, t, wait)?;
     }
+    cleanup_job_uploads(&dir, &mut job)?;
     if let Some(output) = common.output.as_deref()
         && job.status == "completed"
     {
@@ -1024,12 +1225,24 @@ fn complete_image(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
         bail!("provider image MIME disagrees with actual bytes");
     }
     let file = format!("result.{extension}");
-    crate::io::atomic_write(&dir.join(&file), &bytes, true)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(&bytes)?;
+    temp.as_file().sync_all()?;
+    if let Err(error) = validate_generated_media(temp.path(), mime) {
+        job.error = Some(format!("Provider image result is not decodable: {error:#}"));
+        if let Some(usage) = response.get("usage") {
+            job.usage = Some(usage.clone());
+        }
+        save_job(dir, job)?;
+        bail!("{}; job {}", job.error.as_deref().unwrap(), job.id);
+    }
+    temp.persist(dir.join(&file)).map_err(|e| e.error)?;
     job.artifact = Some(Artifact {
         sha256: crate::media::file_sha256(&dir.join(&file))?,
         file,
         media_type: mime.into(),
         bytes: bytes.len() as u64,
+        decode_validation_version: 1,
     });
     job.usage = response.get("usage").cloned();
     job.status = "completed".into();
@@ -1094,6 +1307,11 @@ fn refresh_video(dir: &Path, job: &mut Job, transport: &Transport, wait: u64) ->
             }) {
                 bail!("video output exceeds 64 megapixels per frame");
             }
+            if let Err(error) = validate_generated_media(temp.path(), "video/mp4") {
+                job.error = Some(format!("Provider video result is not decodable: {error:#}"));
+                save_job(dir, job)?;
+                bail!("{}; job {}", job.error.as_deref().unwrap(), job.id);
+            }
             let sha256 = crate::media::file_sha256(temp.path())?;
             let bytes = temp.as_file().metadata()?.len();
             temp.persist(dir.join("result.mp4")).map_err(|e| e.error)?;
@@ -1102,6 +1320,7 @@ fn refresh_video(dir: &Path, job: &mut Job, transport: &Transport, wait: u64) ->
                 sha256,
                 media_type: "video/mp4".into(),
                 bytes,
+                decode_validation_version: 1,
             });
             job.status = "completed".into();
             job.error = None;
@@ -1122,7 +1341,7 @@ fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> 
         .artifact
         .as_ref()
         .context("completed job lacks artifact")?;
-    let source = artifact_path(dir, artifact)?;
+    let source = verified_artifact_path(dir, artifact)?;
     if output.exists() && output.canonicalize()? == source.canonicalize()? {
         bail!("publication path is protected job artifact");
     }
@@ -1131,6 +1350,9 @@ fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> 
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
+    if is_audio_task_mime(&artifact.media_type) {
+        return publish_audio(&source, output, &extension, overwrite);
+    }
     if artifact.media_type == "video/mp4" && extension != "mp4" {
         bail!("video publication requires .mp4");
     }
@@ -1177,6 +1399,102 @@ fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> 
     }
     Ok(())
 }
+/// Read atomic job snapshots while holding the storage lock; never take job locks here.
+pub(crate) fn active_storage_uploads(
+    exclude: Option<&str>,
+) -> Result<std::collections::HashSet<String>> {
+    let root = jobs_root()?;
+    let mut active = std::collections::HashSet::new();
+    if !root.exists() {
+        return Ok(active);
+    }
+    for (index, entry) in fs::read_dir(root)?.enumerate() {
+        if index >= 10000 {
+            bail!("active upload scan exceeds 10000 job entries; no objects were deleted");
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else { continue };
+        if exclude == Some(id)
+            || valid_id(id).is_err()
+            || !entry.file_type()?.is_dir()
+            || !entry.path().join("job.json").exists()
+        {
+            continue;
+        }
+        let job = load_job(&entry.path())?;
+        if matches!(job.status.as_str(), "completed" | "failed" | "rejected") {
+            continue;
+        }
+        for reference in job.references {
+            if let Some(value) = reference.get("storage_upload") {
+                let record: crate::storage::UploadRecord = serde_json::from_value(value.clone())?;
+                record.validate()?;
+                active.insert(record.identity()?);
+            }
+        }
+    }
+    Ok(active)
+}
+fn cleanup_job_uploads(dir: &Path, job: &mut Job) -> Result<()> {
+    // Even known failures retain uploads: callers can reuse or explicitly purge them.
+    if job.status != "completed" {
+        return Ok(());
+    }
+    let candidates: Vec<_> = job
+        .references
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reference)| {
+            (reference["cleanup_requested"] == true && reference["cleanup_status"] != "deleted")
+                .then(|| {
+                    reference
+                        .get("storage_upload")
+                        .cloned()
+                        .map(|record| (index, record))
+                })
+                .flatten()
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    verified_artifact_path(
+        dir,
+        job.artifact
+            .as_ref()
+            .context("completed job lacks artifact")?,
+    )?;
+    for (index, value) in candidates {
+        let result = (|| -> Result<bool> {
+            let record: crate::storage::UploadRecord = serde_json::from_value(value)?;
+            record.validate()?;
+            let _storage_lock = crate::storage::operation_lock()?;
+            if active_storage_uploads(Some(&job.id))?.contains(&record.identity()?) {
+                return Ok(false);
+            }
+            crate::storage::delete_upload(&record)?;
+            Ok(true)
+        })();
+        let reference = &mut job.references[index];
+        match result {
+            Ok(true) => {
+                reference["cleanup_status"] = json!("deleted");
+                reference.as_object_mut().unwrap().remove("cleanup_error");
+            }
+            Ok(false) => {
+                reference["cleanup_status"] = json!("deferred_active_job");
+            }
+            Err(error) => {
+                reference["cleanup_status"] = json!("failed");
+                reference["cleanup_error"] =
+                    json!(format!("{error:#}").chars().take(1024).collect::<String>());
+            }
+        }
+        save_job(dir, job)?;
+    }
+    Ok(())
+}
 pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
     match command {
         JobsCommand::List => {
@@ -1213,6 +1531,18 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
             {
                 refresh_video(&dir, &mut job, &Transport::new()?, 0)?;
             }
+            if refresh
+                && is_audio_task(&job.task)
+                && job.usage.as_ref().is_none_or(Value::is_null)
+                && let Some(id) = &job.generation_id
+                && let Some(usage) = Transport::new()?.billing(id)?
+            {
+                job.usage = Some(usage);
+                save_job(&dir, &mut job)?;
+            }
+            if refresh {
+                cleanup_job_uploads(&dir, &mut job)?;
+            }
             public_job(&dir, &job)
         }
         JobsCommand::Resume {
@@ -1228,7 +1558,7 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
             validate_output(output.as_deref(), &job.references, overwrite)?;
             if let Some(id) = adopt {
                 remote_id(&id)?;
-                if job.task == "image-generation"
+                if is_synchronous_task(&job.task)
                     || job.remote_id.is_some()
                     || !matches!(job.status.as_str(), "submitting" | "uncertain")
                 {
@@ -1241,7 +1571,7 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 job.error = None;
                 save_job(&dir, &mut job)?;
             }
-            if job.task == "image-generation"
+            if is_synchronous_task(&job.task)
                 && job.status == "submitting"
                 && dir.join("response.json").is_file()
             {
@@ -1253,11 +1583,20 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                     open_regular(&dir.join("response.json"), false)?,
                     MAX_JSON,
                 )?)?;
-                complete_image(&dir, &mut job, &value)?;
+                complete_synchronous(&dir, &mut job, &value)?;
             }
-            if !matches!(job.status.as_str(), "completed" | "failed" | "rejected") {
+            if is_synchronous_task(&job.task) && job.status == "submitting" {
+                recover_audio_generation_id(&dir, &mut job)?;
+                job.status = "uncertain".into();
+                job.error=Some("Previous process stopped during paid submission; check OpenRouter activity and do not blindly repeat it.".into());
+                save_job(&dir, &mut job)?;
+            }
+            if !is_synchronous_task(&job.task)
+                && !matches!(job.status.as_str(), "completed" | "failed" | "rejected")
+            {
                 refresh_video(&dir, &mut job, &Transport::new()?, wait)?;
             }
+            cleanup_job_uploads(&dir, &mut job)?;
             if let Some(output) = output
                 && job.status == "completed"
             {
@@ -1304,19 +1643,47 @@ pub fn execute_upscale(command: UpscaleCommand) -> Result<Value> {
             {
                 bail!("model does not support selected creativity");
             }
-            let (source_url, references) = upscale_source(&args)?;
+            let upload = if args.upload {
+                Some(crate::storage::plan_upload(
+                    args.input
+                        .as_deref()
+                        .context("--upload requires a local MP4 input")?,
+                )?)
+            } else {
+                None
+            };
+            let (source_url, references) = if let Some(plan) = &upload {
+                plan.protect_output(args.common.output.as_deref())?;
+                let config_path = crate::storage::config_path()?.canonicalize()?;
+                (
+                    plan.record.public_url()?,
+                    vec![
+                        json!({"path":plan.source,"sha256":plan.record.sha256,"bytes":plan.record.bytes,
+                    "media_type":"video/mp4","storage_upload":plan.record,"cleanup_requested":args.delete_upload_after,
+                    "cleanup_status":if args.delete_upload_after {"pending"} else {"retained"}}),
+                        json!({"path":config_path,"kind":"storage_configuration"}),
+                    ],
+                )
+            } else {
+                upscale_source(&args)?
+            };
+            validate_public_url(&url::Url::parse(&source_url)?)?;
             let mut body = json!({"model":model,"upscale_factor":args.factor,"creativity":args.creativity,"input_references":[{"type":"video_url","video_url":{"url":source_url}}]});
             if let Some(prompt) = args.prompt {
                 body["prompt"] = json!(prompt);
             }
-            submit(Prepared {
-                task: "video-upscaling".into(),
-                model,
-                body,
-                references,
-                common: args.common,
-                wait: args.wait,
-            })
+            submit_with_upload(
+                Prepared {
+                    task: "video-upscaling".into(),
+                    model,
+                    body,
+                    references,
+                    common: args.common,
+                    wait: args.wait,
+                },
+                None,
+                upload,
+            )
         }
     }
 }
@@ -1332,7 +1699,7 @@ fn upscale_source(args: &VideoUpscaleArgs) -> Result<(String, Vec<Value>)> {
         if job.status != "completed" {
             bail!("source job must be completed");
         }
-        let path = artifact_path(&dir, artifact)?;
+        let path = verified_artifact_path(&dir, artifact)?;
         let remote = job
             .remote_id
             .as_deref()
@@ -1356,7 +1723,7 @@ fn upscale_source(args: &VideoUpscaleArgs) -> Result<(String, Vec<Value>)> {
         )
     } else {
         bail!(
-            "OpenRouter video upscaling accepts HTTPS sources only. Use --source-job ID for generated video or --source-url for your hosted file; local MP4 upload is not supported by OpenRouter."
+            "OpenRouter video upscaling accepts HTTPS sources only. Use --source-job ID for generated video or --source-url for your hosted file; or --upload with a configured public S3/R2 bucket for local MP4 files."
         );
     };
     validate_public_url(&url::Url::parse(&url)?)?;
@@ -1428,6 +1795,243 @@ fn resize_image(input: &Path, output: &Path, factor: f64, overwrite: bool) -> Re
     Ok(
         json!({"input":input,"output":output,"width":width,"height":height,"factor":factor,"method":"ffmpeg-lanczos","ai":false,"paid_request":false,"sha256":crate::media::file_sha256(output)?}),
     )
+}
+
+fn recover_audio_generation_id(dir: &Path, job: &mut Job) -> Result<()> {
+    let headers = dir.join("audio-response-headers.json");
+    if is_audio_task(&job.task) && job.generation_id.is_none() && headers.exists() {
+        let metadata: Value =
+            serde_json::from_slice(&limited(open_regular(&headers, false)?, 16 * 1024)?)?;
+        if let Some(id) = metadata["generation_id"].as_str().filter(|s| !s.is_empty()) {
+            remote_id(id)?;
+            job.generation_id = Some(id.into());
+        }
+    }
+    Ok(())
+}
+fn is_audio_task(task: &str) -> bool {
+    matches!(task, "speech-generation" | "music-generation")
+}
+fn is_audio_task_mime(mime: &str) -> bool {
+    matches!(mime, "audio/mpeg" | "audio/wav")
+}
+fn is_synchronous_task(task: &str) -> bool {
+    task == "image-generation" || is_audio_task(task)
+}
+pub(crate) fn read_bounded_file(path: &Path, max: usize) -> Result<Vec<u8>> {
+    limited(open_regular(path, false)?, max)
+}
+pub(crate) fn audio_image_reference(path: &Path, refs: &mut Vec<Value>) -> Result<Value> {
+    let part = add_image(path, refs)?;
+    validate_generated_media(
+        path,
+        refs.last()
+            .and_then(|v| v["media_type"].as_str())
+            .context("image reference lacks MIME")?,
+    )?;
+    Ok(part)
+}
+pub(crate) fn submit_audio(
+    task: &str,
+    model: String,
+    body: Value,
+    references: Vec<Value>,
+    common: Common,
+) -> Result<Value> {
+    if !is_audio_task(task) {
+        bail!("invalid synchronous audio task");
+    }
+    submit(Prepared {
+        task: task.into(),
+        model,
+        body,
+        references,
+        common,
+        wait: 0,
+    })
+}
+fn complete_synchronous(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
+    if job.task == "image-generation" {
+        return complete_image(dir, job, response);
+    }
+    if !is_audio_task(&job.task) {
+        bail!("invalid synchronous result task");
+    }
+    let audio = crate::audio_generation::audio_data(response)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix("audio-")
+        .suffix(&format!(".{}", audio.extension))
+        .tempfile_in(dir)?;
+    temp.write_all(&audio.bytes)?;
+    temp.as_file().sync_all()?;
+    crate::audio_generation::validate_audio(temp.path(), audio.media_type)?;
+    let file = format!("result.{}", audio.extension);
+    temp.persist(dir.join(&file)).map_err(|e| e.error)?;
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    job.artifact = Some(Artifact {
+        file,
+        sha256: bytes_sha256(&audio.bytes),
+        media_type: audio.media_type.into(),
+        bytes: audio.bytes.len() as u64,
+        decode_validation_version: 1,
+    });
+    if let Some(id) = response["generation_id"].as_str().filter(|v| !v.is_empty()) {
+        remote_id(id)?;
+        job.generation_id = Some(id.into());
+    }
+    if let Some(usage) = response.get("usage").filter(|v| !v.is_null()) {
+        job.usage = Some(usage.clone());
+    }
+    job.output_text = response["text"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    job.status = "completed".into();
+    job.error = None;
+    save_job(dir, job)
+}
+fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool) -> Result<()> {
+    if !matches!(extension, "mp3" | "wav") {
+        bail!("audio publication requires .mp3 or .wav");
+    }
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp = tempfile::Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile_in(parent)?;
+    if source.extension().and_then(|v| v.to_str()) == Some(extension) {
+        fs::copy(source, temp.path())?;
+    } else {
+        let mut args = crate::process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-xerror",
+            "-y",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ]);
+        args.push(source.as_os_str().to_owned());
+        args.extend(crate::process::args(&["-map", "0:a:0", "-vn"]));
+        if extension == "wav" {
+            args.extend(crate::process::args(&[
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+            ]));
+        }
+        args.push(temp.path().as_os_str().to_owned());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(180), 1024 * 1024)?;
+    }
+    if temp.as_file().metadata()?.len() > 128 * 1024 * 1024 {
+        bail!("published audio exceeds 128 MiB");
+    }
+    temp.as_file().sync_all()?;
+    if overwrite {
+        temp.persist(output).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(output).map_err(|e| e.error)?;
+    }
+    Ok(())
+}
+impl Transport {
+    fn generated_response(&self, task: &str, body: &Value, dir: &Path) -> Result<Value> {
+        if !is_audio_task(task) {
+            return self.json(
+                if task == "image-generation" {
+                    "/images"
+                } else {
+                    "/videos"
+                },
+                Some(body),
+            );
+        }
+        let endpoint = if task == "speech-generation" {
+            "/audio/speech"
+        } else {
+            "/chat/completions"
+        };
+        let encoded = serde_json::to_vec(body)?;
+        if encoded.len() > MAX_REQUEST {
+            bail!("audio request exceeds 64 MiB");
+        }
+        let response = self
+            .client
+            .post(format!("{}{endpoint}", self.base))
+            .bearer_auth(&self.key)
+            .header("Content-Type", "application/json")
+            .header("X-Title", "Skywrite")
+            .body(encoded)
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = limited(response, MAX_JSON)?;
+            return Err(HttpRejection {
+                status: status.as_u16(),
+                message: self.diagnostic(&String::from_utf8_lossy(&bytes), Some(body)),
+            }
+            .into());
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let generation_id = response
+            .headers()
+            .get("x-generation-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if !generation_id.is_empty() {
+            remote_id(&generation_id)?;
+        }
+        crate::io::write_json(
+            &dir.join("audio-response-headers.json"),
+            &json!({"generation_id":generation_id,"content_type":content_type}),
+            true,
+        )?;
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        if task == "music-generation" {
+            if !content_type
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+            {
+                bail!("music response was not the requested event stream");
+            }
+            return crate::audio_generation::parse_music_stream(response);
+        }
+        if !content_type.to_ascii_lowercase().starts_with("audio/") {
+            bail!("speech response did not contain audio");
+        }
+        let bytes = limited(response, crate::audio_generation::MAX_AUDIO)?;
+        let usage = if !generation_id.is_empty() {
+            self.billing(&generation_id).ok().flatten()
+        } else {
+            None
+        };
+        Ok(
+            json!({"audio":{"data":base64::engine::general_purpose::STANDARD.encode(bytes)},"generation_id":generation_id,"provider_content_type":content_type,"usage":usage}),
+        )
+    }
+    /// Billing lookup is optional metadata only; absence is unknown cost, never zero.
+    fn billing(&self, id: &str) -> Result<Option<Value>> {
+        remote_id(id)?;
+        let result = self.json(&format!("/generation?id={id}"), None)?;
+        Ok(result["data"]["total_cost"]
+            .as_f64()
+            .map(|cost| json!({"cost":cost,"source":"OpenRouter generation metadata"})))
+    }
 }
 
 #[cfg(test)]
@@ -1752,6 +2356,102 @@ mod tests {
         }
     }
     #[test]
+    fn undecodable_video_remains_ready_and_retry_only_downloads() {
+        if std::env::var_os("SKYWRITE_VIDEO_DECODE_TEST_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "generation::tests::undecodable_video_remains_ready_and_retry_only_downloads",
+                    "--nocapture",
+                ])
+                .env("SKYWRITE_VIDEO_DECODE_TEST_CHILD", "1")
+                .env("SKYWRITE_HOME", temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mp4");
+        let mut args = crate::process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=orange:s=32x24:r=24:d=0.25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]);
+        args.push(source.as_os_str().to_owned());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(15), 1024 * 1024).unwrap();
+        let healthy = fs::read(&source).unwrap();
+        let mut corrupt = healthy.clone();
+        let mdat = corrupt.windows(4).position(|p| p == b"mdat").unwrap();
+        let size = u32::from_be_bytes(corrupt[mdat - 4..mdat].try_into().unwrap()) as usize;
+        corrupt[mdat + 4..mdat - 4 + size].fill(0);
+        fs::write(temp.path().join("corrupt.mp4"), &corrupt).unwrap();
+        assert!(
+            crate::media::probe(&temp.path().join("corrupt.mp4"))
+                .unwrap()
+                .has_video()
+        );
+        let binary_response = |bytes: &[u8]| {
+            [format!("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes(), bytes.to_vec()].concat()
+        };
+        let (transport, seen, handle) = server(
+            vec![
+                json_http(json!({"id":"decode-job","status":"completed","usage":{"cost":0.25}})),
+                binary_response(&corrupt),
+                binary_response(&healthy),
+            ],
+            true,
+        );
+        let error = submit_with(
+            prepared("video-generation", "decode-recovery"),
+            Some(&transport),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("decode validation"));
+        let dir = fs::read_dir(jobs_root().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let retained = load_job(&dir).unwrap();
+        assert_eq!(retained.status, "ready");
+        assert!(retained.artifact.is_none());
+        assert_eq!(retained.usage.unwrap()["cost"], 0.25);
+        assert!(!dir.join("result.mp4").exists());
+        let done = submit_with(
+            prepared("video-generation", "decode-recovery"),
+            Some(&transport),
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["artifact"]["decode_validation_version"], 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().filter(|line| line.starts_with("POST")).count(),
+            1
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|line| line.contains("/content?"))
+                .count(),
+            2
+        );
+    }
+    #[test]
     fn media_bounds_and_capability_inverse() {
         assert_eq!(limited(&b"1234"[..], 4).unwrap(), b"1234");
         assert!(limited(&b"12345"[..], 4).is_err());
@@ -1784,5 +2484,121 @@ mod tests {
         let message = t.diagnostic("SECRET https://example.com/x?token=private", Some(&request));
         assert!(!message.contains("SECRET"));
         assert!(!message.contains("token=private"));
+    }
+    #[test]
+    fn audio_jobs_http_recovery() {
+        if std::env::var_os("SKYWRITE_AUDIO_JOB_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "generation::tests::audio_jobs_http_recovery",
+                    "--nocapture",
+                ])
+                .env("SKYWRITE_AUDIO_JOB_CHILD", "1")
+                .env("SKYWRITE_HOME", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let mut args = crate::process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:duration=0.2",
+            "-acodec",
+            "pcm_s16le",
+        ]);
+        args.push(wav.path().as_os_str().to_owned());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(10), 1024 * 1024).unwrap();
+        let bytes = fs::read(wav.path()).unwrap();
+        let raw=[format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes(),bytes.clone()].concat();
+        let (transport, seen, handle) = server(vec![raw], true);
+        let speech = || {
+            let mut p = prepared("speech-generation", "speech-http");
+            p.body = json!({"model":"test/model","input":"Hello","voice":"test","response_format":"mp3"});
+            p
+        };
+        let first = submit_with(speech(), Some(&transport)).unwrap();
+        assert_eq!(first["status"], "completed");
+        handle.join().unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].split_whitespace().nth(1),
+            Some("/audio/speech")
+        );
+        let dir = jobs_root().unwrap().join(first["id"].as_str().unwrap());
+        let mut job = load_job(&dir).unwrap();
+        job.status = "submitting".into();
+        job.artifact = None;
+        save_job(&dir, &mut job).unwrap();
+        fs::remove_file(dir.join("result.wav")).unwrap();
+        let restored = submit_with(speech(), Some(&transport)).unwrap();
+        assert_eq!(restored["status"], "completed");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "savedresponse recovery must not repeat speech POST"
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let stream = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"gen-music-test","choices":[{"delta":{"audio":{"data":encoded}}}]}),
+            json!({"id":"gen-music-test","choices":[],"usage":{"cost":0.04}})
+        );
+        let response=[format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",stream.len()).into_bytes(),stream.into_bytes()].concat();
+        let (transport, seen, handle) = server(vec![response], true);
+        let music = || prepared("music-generation", "music-http");
+        let first = submit_with(music(), Some(&transport)).unwrap();
+        assert_eq!(first["status"], "completed");
+        assert_eq!(first["usage"]["cost"], 0.04);
+        handle.join().unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].split_whitespace().nth(1),
+            Some("/chat/completions")
+        );
+        assert_eq!(
+            submit_with(music(), Some(&transport)).unwrap()["id"],
+            first["id"]
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let partial = b"data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"SUQz\"}}}]}\n\n";
+        let response=[format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",partial.len()).into_bytes(),partial.to_vec()].concat();
+        let (transport, seen, handle) = server(vec![response], true);
+        let incomplete = || prepared("music-generation", "music-partial");
+        assert!(submit_with(incomplete(), Some(&transport)).is_err());
+        handle.join().unwrap();
+        assert_eq!(
+            submit_with(incomplete(), Some(&transport)).unwrap()["status"],
+            "uncertain"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "incomplete audio stream must not resubmit"
+        );
+    }
+    #[test]
+    fn music_reference_blobs_are_not_persisted_or_echoed_in_errors() {
+        let body = json!({"model":"google/lyria-test","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}","x".repeat(1024*1024))}}]}]});
+        let clean = sanitized_request(&body);
+        assert!(serde_json::to_vec(&clean).unwrap().len() < 1024);
+        let t = Transport {
+            client: Transport::client().unwrap(),
+            key: "SECRET".into(),
+            base: BASE.into(),
+        };
+        let body = json!({"messages":[{"content":[{"image_url":{"url":"data:image/png;base64,SECRETIMAGE"}}]}]});
+        let error = t.diagnostic(
+            "bad reference data:image/png;base64,SECRETIMAGE plus SECRET",
+            Some(&body),
+        );
+        assert!(!error.contains("data:image"));
+        assert!(!error.contains("SECRET"));
     }
 }

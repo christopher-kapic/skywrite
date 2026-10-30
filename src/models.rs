@@ -10,62 +10,145 @@ const TTL: u64 = 24 * 60 * 60;
 const MAX_CATALOG: u64 = 8 * 1024 * 1024;
 pub const TASKS: &[&str] = crate::workspace::MODEL_TASKS;
 
+/// Canonical task names are persisted; short aliases are accepted at CLI boundaries.
+pub fn canonical_task(task: &str) -> Result<&'static str> {
+    let name = match task {
+        "image" => "image-generation",
+        "video" => "video-generation",
+        "speech" => "speech-generation",
+        "music" => "music-generation",
+        other => other,
+    };
+    TASKS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == name)
+        .with_context(|| {
+            format!(
+                "unknown model task {task}; choose {} (aliases: image, video, speech, music)",
+                TASKS.join(", ")
+            )
+        })
+}
 pub fn validate_task(task: &str) -> Result<()> {
-    if !TASKS.contains(&task) {
-        bail!("unknown model task {task}; choose {}", TASKS.join(", "));
-    }
-    Ok(())
+    canonical_task(task).map(|_| ())
+}
+pub fn task_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(TASKS.iter().map(|task| {
+        let value = clap::builder::PossibleValue::new(*task);
+        match *task {
+            "image-generation" => value.alias("image"),
+            "video-generation" => value.alias("video"),
+            "speech-generation" => value.alias("speech"),
+            "music-generation" => value.alias("music"),
+            _ => value,
+        }
+    }))
 }
 pub fn task_environment(task: &str) -> Result<String> {
-    validate_task(task)?;
+    let task = canonical_task(task)?;
     Ok(format!(
         "SKYWRITE_{}_MODEL",
         task.replace('-', "_").to_uppercase()
     ))
 }
-/// No automatic "best model" substitution; a missing model is an actionable error.
-pub fn resolve_model(task: &str, explicit: Option<&str>) -> Result<String> {
-    let environment = task_environment(task)?;
-    let selected = explicit
-        .map(str::to_owned)
-        .or_else(|| {
-            std::env::var(&environment)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
-        .or_else(|| {
-            if matches!(task, "analysis" | "editing") {
-                std::env::var("OPENROUTER_VISION_MODEL")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            } else {
-                None
-            }
-        });
-    let selected = match selected {
-        Some(model) => Some(model),
-        None => crate::workspace::get_default_model(task)?,
-    }
-    .or_else(|| {
-        if task == "transcription" {
-            Some("openai/whisper-large-v3".into())
-        } else {
-            None
-        }
-    });
-    let model = selected.with_context(|| {
-        format!(
-            "{task} requires --model, {environment}, or skywrite models set-default {task} MODEL"
-        )
-    })?;
-    if model.is_empty()
-        || model.len() > 256
-        || model.chars().any(char::is_whitespace)
-        || model.chars().any(char::is_control)
+
+#[derive(Debug, Serialize)]
+pub struct ModelSelection {
+    pub task: String,
+    pub model: Option<String>,
+    pub source: &'static str,
+    pub environment_variable: String,
+    pub legacy_environment_variable: Option<&'static str>,
+    pub saved_model: Option<String>,
+    pub saved_inspected: bool,
+}
+
+fn selected_model(
+    task: &'static str,
+    explicit: Option<&str>,
+    saved_model: Option<String>,
+    saved_inspected: bool,
+) -> Result<ModelSelection> {
+    let environment_variable = task_environment(task)?;
+    let legacy_environment_variable =
+        matches!(task, "analysis" | "editing").then_some("OPENROUTER_VISION_MODEL");
+    let task_environment = std::env::var(&environment_variable)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let legacy = legacy_environment_variable
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty());
+    let (model, source) = if let Some(model) = explicit {
+        (Some(model.to_owned()), "explicit")
+    } else if let Some(model) = task_environment {
+        (Some(model), "environment")
+    } else if let Some(model) = legacy {
+        (Some(model), "legacy_environment")
+    } else if let Some(model) = saved_model.as_ref() {
+        (Some(model.clone()), "saved")
+    } else if task == "transcription" {
+        (Some("openai/whisper-large-v3".into()), "builtin")
+    } else {
+        (None, "unset")
+    };
+    if let Some(model) = &model
+        && (model.is_empty()
+            || model.len() > 256
+            || model
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control()))
     {
-        bail!("model ID must contain 1..256 non-whitespace characters");
+        bail!("model ID must contain 1..256 UTF-8 bytes without whitespace or controls");
     }
-    Ok(model)
+    Ok(ModelSelection {
+        task: task.into(),
+        model,
+        source,
+        environment_variable,
+        legacy_environment_variable,
+        saved_model,
+        saved_inspected,
+    })
+}
+
+/// Select exactly as runtime commands do. Higher-precedence overrides do not
+/// depend on reading an unused personal config (including a malformed config).
+pub fn selection(task: &str, explicit: Option<&str>) -> Result<ModelSelection> {
+    let task = canonical_task(task)?;
+    let higher = selected_model(task, explicit, None, false)?;
+    if matches!(
+        higher.source,
+        "explicit" | "environment" | "legacy_environment"
+    ) {
+        return Ok(higher);
+    }
+    selected_model(
+        task,
+        explicit,
+        crate::workspace::get_default_model(task)?,
+        true,
+    )
+}
+
+/// Configuration inspection loads one consistent config snapshot, but uses the
+/// identical selection function and precedence as a real media command.
+pub fn selection_with_defaults(
+    task: &str,
+    explicit: Option<&str>,
+    saved: &BTreeMap<String, String>,
+) -> Result<ModelSelection> {
+    let task = canonical_task(task)?;
+    selected_model(task, explicit, saved.get(task).cloned(), true)
+}
+
+/// No automatic "best model" substitution; a missing model is actionable.
+pub fn resolve_model(task: &str, explicit: Option<&str>) -> Result<String> {
+    let selection = selection(task, explicit)?;
+    selection.model.with_context(|| format!(
+        "{} requires --model, {}, or skywrite defaults {} set MODEL (skywrite init can add starter preferences)",
+        selection.task, selection.environment_variable, selection.task
+    ))
 }
 #[derive(Default)]
 pub struct ListOptions<'a> {
@@ -186,15 +269,12 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     if options.offline && options.refresh {
         bail!("--offline and --refresh cannot be combined");
     }
-    if let Some(task) = options.task {
-        validate_task(task)?;
-    }
     if options.search.is_some_and(|s| s.len() > 256) {
         bail!("model search exceeds 256 bytes");
     }
     let mut sources = Vec::new();
     let mut data = Vec::new();
-    let task = options.task;
+    let task = options.task.map(canonical_task).transpose()?;
     if task.is_none() || matches!(task, Some("analysis" | "editing")) {
         let (catalog, metadata) = load_catalog(options, "models")?;
         sources.push(metadata);
@@ -224,6 +304,26 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
                 .cloned()
                 .map(|v| normalize(v, "audio/transcriptions", None)),
         );
+    }
+    if task.is_none() || task == Some("speech-generation") {
+        let (catalog, metadata) = load_catalog(options, "models?output_modalities=speech")?;
+        sources.push(metadata);
+        data.extend(catalog["data"].as_array().unwrap().iter().cloned().map(|mut value| {
+            value["task"] = json!("speech-generation");
+            value["pricing_note"] = json!("Speech prices can be per input character or generated second; consult the selected model. Voice identifiers and output formats differ by provider.");
+            normalize(value, "audio/speech", None)
+        }));
+    }
+    if task.is_none() || task == Some("music-generation") {
+        let (catalog, metadata) = load_catalog(options, "models?output_modalities=audio")?;
+        sources.push(metadata);
+        data.extend(catalog["data"].as_array().unwrap().iter().filter(|value| {
+            value["id"].as_str().is_some_and(|id| id.starts_with("google/lyria-"))
+        }).cloned().map(|mut value| {
+            value["task"] = json!("music-generation");
+            value["pricing_note"] = json!("Music is billed per generated song/clip. Zero generic token prices do NOT mean free music; check the model's song price. Prompted duration, instrumentation and vocals are requests, not guarantees.");
+            normalize(value, "chat/completions", None)
+        }));
     }
     if task.is_none() || matches!(task, Some("image-generation" | "image-upscaling")) {
         let (catalog, metadata) = load_catalog(options, "images/models")?;

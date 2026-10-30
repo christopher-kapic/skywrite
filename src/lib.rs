@@ -15,3 +15,9 @@ pub mod transcript;
 pub mod workspace;
 
 pub mod generation;
+
+pub mod outputs;
+pub mod storage;
+
+pub mod audio_generation;
+pub mod config_cli;

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "curated_on": "2026-10-30",
+  "note": "Explicit starter preferences, not an automatically changing best-model ranking. Availability and prices can change. Initialization is offline and makes no paid requests.",
+  "presets": [
+    {"task":"analysis","model":"google/gemini-3.5-flash-lite","reason":"Low-cost multimodal model used in Skywrite's public-media understanding validation."},
+    {"task":"transcription","model":"openai/whisper-large-v3","reason":"Existing word-timestamp transcription model used in public-media validation."},
+    {"task":"editing","model":"google/gemini-3.5-flash-lite","reason":"Used for a validated edit suggestion; inspect and revise generated editorial choices."},
+    {"task":"image-generation","model":"black-forest-labs/flux-3-image-klein","reason":"Low-cost image and reference-image generation verified in the character workflow."},
+    {"task":"video-generation","model":"minimax/hailuo-3-max","reason":"H3 Max was verified with an image-guided five-second clip. Choose duration and resolution explicitly; full H3 can be selected separately."},
+    {"task":"image-upscaling","model":null,"reason":"The current image upscaler uses local FFmpeg Lanczos resizing. No dedicated OpenRouter image-upscaling model is selected."},
+    {"task":"video-upscaling","model":"black-forest-labs/flux-video-upscale","reason":"Dedicated video upscaling verified with a generated video source; local files need configured hosting."},
+    {"task":"speech-generation","model":"hexgrad/kokoro-82m","reason":"Low-cost speech catalog option with named voices. Select a supported voice, for example af_heart; format and voice support vary by model."},
+    {"task":"music-generation","model":"google/lyria-3-clip-preview","reason":"Short music clips were verified through the audio API. Music is billed per clip/song, even when generic token prices are zero."}
+  ]
+}

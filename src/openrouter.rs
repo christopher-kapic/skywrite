@@ -78,6 +78,8 @@ impl OpenRouter {
                 | "models?output_modalities=image"
                 | "models?output_modalities=video"
                 | "models?output_modalities=transcription"
+                | "models?output_modalities=speech"
+                | "models?output_modalities=audio"
                 | "images/models"
                 | "videos/models"
         ) {

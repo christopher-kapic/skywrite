@@ -20,6 +20,8 @@ pub const MODEL_TASKS: &[&str] = &[
     "video-generation",
     "image-upscaling",
     "video-upscaling",
+    "speech-generation",
+    "music-generation",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +82,10 @@ const BUILTINS: &[(&str, &str)] = &[
     (
         "character-reference",
         include_str!("../assets/skills/character-reference.md"),
+    ),
+    (
+        "technical-explainer",
+        include_str!("../assets/skills/technical-explainer.md"),
     ),
 ];
 
@@ -420,19 +426,22 @@ pub fn model_defaults() -> Result<BTreeMap<String, String>> {
     defaults_from(&read_config(&home.join("config.json"))?)
 }
 pub fn get_default_model(task: &str) -> Result<Option<String>> {
+    let task = crate::models::canonical_task(task)?;
     validate_task(task)?;
     Ok(model_defaults()?.remove(task))
 }
 pub fn set_default_model(task: &str, model: &str) -> Result<Value> {
+    let task = crate::models::canonical_task(task)?;
     validate_task(task)?;
     validate_model(model)?;
     change_default(task, Some(model))
 }
 pub fn unset_default_model(task: &str) -> Result<Value> {
+    let task = crate::models::canonical_task(task)?;
     validate_task(task)?;
     change_default(task, None)
 }
-fn change_default(task: &str, model: Option<&str>) -> Result<Value> {
+fn lock_config() -> Result<(PathBuf, File)> {
     let home = personal_home()?;
     check_directory(&home, true)?;
     let path = home.join("config.json");
@@ -457,6 +466,11 @@ fn change_default(task: &str, model: Option<&str>) -> Result<Value> {
         bail!("config lock must be a regular file");
     }
     lock.lock().context("lock personal config")?;
+    Ok((path, lock))
+}
+
+fn change_default(task: &str, model: Option<&str>) -> Result<Value> {
+    let (path, _lock) = lock_config()?;
     let mut config = read_config(&path)?;
     let mut defaults = defaults_from(&config)?;
     match model {
@@ -476,5 +490,53 @@ fn change_default(task: &str, model: Option<&str>) -> Result<Value> {
     publish(&path, &bytes, true)?;
     Ok(
         json!({"task":task,"model":model,"model_defaults":defaults,"path":path.display().to_string()}),
+    )
+}
+
+/// Merge only missing starter preferences under the same stable lock used by
+/// individual setters. A dry run reads an atomic snapshot without creating files.
+pub fn initialize_default_models(
+    starters: &BTreeMap<String, String>,
+    dry_run: bool,
+) -> Result<Value> {
+    for (task, model) in starters {
+        validate_task(task)?;
+        validate_model(model)?;
+    }
+    let (path, _lock) = if dry_run {
+        let home = personal_home()?;
+        check_directory(&home, false)?;
+        (home.join("config.json"), None)
+    } else {
+        let (path, lock) = lock_config()?;
+        (path, Some(lock))
+    };
+    let existed = exists_regular(&path)?;
+    let mut config = read_config(&path)?;
+    let preserved = defaults_from(&config)?;
+    let mut defaults = preserved.clone();
+    let mut added = BTreeMap::new();
+    for (task, model) in starters {
+        if !defaults.contains_key(task) {
+            defaults.insert(task.clone(), model.clone());
+            added.insert(task.clone(), model.clone());
+        }
+    }
+    let would_change = !existed || !added.is_empty();
+    if would_change {
+        config["model_defaults"] = serde_json::to_value(&defaults)?;
+        let mut bytes = serde_json::to_vec_pretty(&config)?;
+        bytes.push(b'\n');
+        if bytes.len() > CONFIG_LIMIT {
+            bail!("personal config exceeds {CONFIG_LIMIT} bytes");
+        }
+        if !dry_run {
+            publish(&path, &bytes, true)?;
+        }
+    }
+    Ok(
+        json!({"initialized":!dry_run,"dry_run":dry_run,"config_path":path,
+        "created":!dry_run && !existed,"changed":!dry_run && would_change,
+        "would_change":would_change,"added":added,"preserved":preserved,"model_defaults":defaults}),
     )
 }

@@ -24,6 +24,12 @@ imagesize = "0.15"
 # Original upstream stable renderer; HTML parsing and raster codecs are native.
 takumi = { version = "=2.19.0", default-features = false, features = ["from-html", "raster-backend", "png", "jpeg", "webp", "woff2"] }
 
+# Apache Arrow's maintained S3/R2 backend; credentials are supplied explicitly.
+object_store = { version = "=0.14.2", default-features = false, features = ["aws"] }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
 [profile.release]
 lto = "thin"
 strip = true

@@ -1,6 +1,6 @@
 # Skywrite
 
-A Rust CLI that gives coding agents a structured view of local media and a small edit format they can validate, render, or export. It uses FFmpeg/ffprobe directly. OpenRouter powers optional transcription, media understanding, and edit suggestions. Hyperframes and Remotion are optional output tools. Upstream Takumi is embedded for native still graphics.
+A Rust CLI that gives coding agents a structured view of local media and a small edit format they can validate, render, or export. It uses FFmpeg/ffprobe directly. OpenRouter powers optional transcription, media understanding, edit suggestions, and image/video/narration/music generation. Hyperframes and Remotion are optional output tools. Upstream Takumi is embedded for native still graphics.
 
 This is an assembly editor: source selection, in points, order, gaps, stills, constant speeds, and audio overlays. Finish detailed transitions, titles, grading, and effects in your NLE or exported composition project.
 
@@ -159,3 +159,13 @@ Google Fonts are explicit: `skywrite image render --file title.html -o title.png
 Generation and upscaling are available through `skywrite generate image|video`, `skywrite upscale image|video`, and `skywrite jobs list|status|resume`. Reuse character references, animate a keyframe, then include generated media in the validated edit format. Durable jobs retain provenance/cost and prevent automatic duplicate paid submissions. Choose a task model explicitly or save its default; preview with `--dry-run`.
 
 AI video upscaling requires `--source-job` for generated video or `--source-url` for your hosted HTTPS source. OpenRouter currently rejects local video uploads/data URLs for this operation. `upscale image` is explicitly non-AI FFmpeg Lanczos resizing. See [generation and jobs](docs/generation.md) for commands and recovery limits.
+
+Public S3/R2 sources for local video upscaling are implemented behind explicit `--upload`, with hash reuse, optional `--delete-upload-after`, and scoped `skywrite storage purge`. **Live bucket compatibility is untested and intentionally left to the user.** See [storage setup and cleanup](docs/storage.md).
+
+## Setup and generated narration/music
+
+`skywrite init` creates offline starter preferences without replacing existing choices. `skywrite defaults image` shows saved/effective choices and their origin; `skywrite defaults image set MODEL` changes the saved preference. Environment overrides still apply. See [configuration](docs/configuration.md).
+
+Discover voices with `skywrite models list --task speech-generation` and music with `skywrite models list --task music-generation`. Generate narration with `skywrite generate speech --file narration.txt --model hexgrad/kokoro-82m --voice af_heart --output narration.mp3`; create a bed with `skywrite generate music --model google/lyria-3-clip-preview --prompt 'Original gentle electronic music' --instrumental --output bed.mp3`. Audio uses the same durable no-duplicate job system and is fully decoded before completion. Music token prices of zero are not a free-song offer.
+
+Read [audio generation and recovery](docs/audio-generation.md) and `skywrite skills read technical-explainer` for narration, real word timing, deterministic diagrams, animation, and mixing music into an edit. MIDI/text-score rendering is deferred. Transfer finished assets between machines with [shared outputs](docs/outputs.md).
