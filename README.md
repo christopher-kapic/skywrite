@@ -15,7 +15,7 @@ cargo build --release --locked
 
 The core is Rust. Direct dependencies are established projects: clap, serde/serde_json, anyhow, reqwest with Rustls, base64, RustCrypto sha2, tempfile, url, and libc. `Cargo.lock` records the exact resolved dependency tree. No Python or Node runtime is needed for inspection, synchronization, FCPXML export, or the native FFmpeg renderer.
 
-All successful commands emit one JSON document on stdout. Progress and errors go to stderr; errors have a JSON `error` object and nonzero exit status. `--help` is human-readable. Output files are never replaced without `--overwrite`. Original media cannot be used as an output destination. Paths in an edit are relative to the edit JSON file; exported FCPXML uses absolute file URLs.
+All successful commands emit one JSON document on stdout. Progress and errors go to stderr; errors have a JSON `error` object and nonzero exit status. `--help` is human-readable. Output files are never replaced without `--overwrite`. Consumed media, edit JSON, transcript, and analysis inputs cannot be used as output destinations, including with `--overwrite`. Paths in an edit are relative to the edit JSON file; exported FCPXML uses absolute file URLs.
 
 ## Understand media
 
@@ -155,3 +155,7 @@ Record **ALL** agent frustrations, bugs and missing features with `skywrite nit 
 Tools can be composed: render a native HTML graphic, add its PNG to a Resolve/FCPXML edit, and use a Remotion/Hyperframes project for animation. Generation workflows can build a character image, derive reference frames and supply them to a compatible video model; always check actual reference capabilities before requesting a paid job.
 
 Google Fonts are explicit: `skywrite image render --file title.html -o title.png --google-font 'Inter:wght@400;700'`. Downloads are cached and `--offline` uses cached variants. Takumi supports upstream `tw` utilities and inline styles, not a full browser or arbitrary Tailwind stylesheet compiler. See [fonts](docs/fonts.md), and [shared cache, model discovery and task defaults](docs/cache-models.md).
+
+Generation and upscaling are available through `skywrite generate image|video`, `skywrite upscale image|video`, and `skywrite jobs list|status|resume`. Reuse character references, animate a keyframe, then include generated media in the validated edit format. Durable jobs retain provenance/cost and prevent automatic duplicate paid submissions. Choose a task model explicitly or save its default; preview with `--dry-run`.
+
+AI video upscaling requires `--source-job` for generated video or `--source-url` for your hosted HTTPS source. OpenRouter currently rejects local video uploads/data URLs for this operation. `upscale image` is explicitly non-AI FFmpeg Lanczos resizing. See [generation and jobs](docs/generation.md) for commands and recovery limits.

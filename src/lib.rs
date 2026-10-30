@@ -13,3 +13,5 @@ pub mod sync;
 pub mod timeline;
 pub mod transcript;
 pub mod workspace;
+
+pub mod generation;

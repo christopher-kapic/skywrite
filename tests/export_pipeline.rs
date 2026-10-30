@@ -573,7 +573,7 @@ fn additional_audio_preserves_content_before_delayed_video() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn python_renderer_cleans_owned_groups_on_cancel_timeout_and_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -600,7 +600,22 @@ def live(pid):
 for mode in ['term','int','timeout','failure','success']:
  marker=root/('pids-'+mode);output=root/('output-'+mode+'.mp4');output.write_bytes(b'protected')
  env=os.environ.copy();env.update(PATH=str(root)+os.pathsep+env['PATH'],MARKER=str(marker),MODE=mode)
- driver="import runpy,sys; m=runpy.run_path(sys.argv[1]); m['PLAN']['timeout_seconds']=0.4; sys.argv=[sys.argv[1], '--output',sys.argv[2],'--overwrite']; m['main']()"
+ driver='''import runpy,sys,os,signal
+m=runpy.run_path(sys.argv[1]); m['PLAN']['timeout_seconds']=0.4
+original_killpg=os.killpg
+def owned_killpg(pid, sig):
+ try:
+  os.waitid(os.P_PID,pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+ except ChildProcessError:
+  # This finite fixture owns this still-live group. Clean it before reporting
+  # the ordering failure so an inherited output pipe cannot hide the assertion.
+  try: original_killpg(pid,signal.SIGKILL)
+  except ProcessLookupError: pass
+  raise AssertionError('leader reaped before final process-group signal')
+ original_killpg(pid,sig)
+os.killpg=owned_killpg
+sys.argv=[sys.argv[1], '--output',sys.argv[2],'--overwrite']; m['main']()
+'''
  p=subprocess.Popen([sys.executable,'-c',driver,str(script),str(output)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
  pids=[]
  try:
@@ -610,6 +625,7 @@ for mode in ['term','int','timeout','failure','success']:
   pids=list(map(int,marker.read_text().split()))
   if mode in ['term','int']:p.send_signal(signal.SIGTERM if mode=='term' else signal.SIGINT)
   stdout,stderr=p.communicate(timeout=3)
+  assert b'leader reaped before final process-group signal' not in stderr,(mode,'lost group identity',stderr)
   if mode=='success': assert p.returncode==0,(mode,p.returncode,stderr)
   else: assert p.returncode!=0,(mode,p.returncode,stderr)
   end=time.monotonic()+1

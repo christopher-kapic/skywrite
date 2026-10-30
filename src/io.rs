@@ -32,6 +32,19 @@ pub fn write_json(path: &Path, value: &impl Serialize, overwrite: bool) -> Resul
     bytes.push(b'\n');
     atomic_write(path, &bytes, overwrite)
 }
+/// Keep consumed files separate from explicitly replaceable output files.
+/// Atomic replacement of a distinct hard link leaves input inode bytes intact.
+pub fn protect_inputs(output: &Path, inputs: &[std::path::PathBuf]) -> Result<()> {
+    if output.exists() {
+        let destination = output.canonicalize()?;
+        for input in inputs {
+            if input.canonicalize().ok().as_ref() == Some(&destination) {
+                bail!("output would overwrite an input file; choose a different output path");
+            }
+        }
+    }
+    Ok(())
+}
 /// Publish a complete output atomically; replacement is always explicit.
 pub fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     let parent = path

@@ -27,7 +27,7 @@ fn cached_provider_words_and_chunk_boundaries_keep_source_timestamps() {
     assert!(status.success());
     let info = skywrite::media::probe(&source).unwrap();
     let cache = temp.path().join("cache");
-    std::fs::create_dir(&cache).unwrap();
+    std::fs::create_dir_all(cache.join("responses")).unwrap();
     let responses = [
         json!({"text":"late early repeat repeat", "words":[
             {"word":"late","start":10.1,"end":10.14},
@@ -47,7 +47,7 @@ fn cached_provider_words_and_chunk_boundaries_keep_source_timestamps() {
             &serde_json::to_vec(&request).unwrap(),
         ]);
         std::fs::write(
-            cache.join(format!("{key}.json")),
+            cache.join("responses").join(format!("{key}.json")),
             serde_json::to_vec(&responses[index]).unwrap(),
         )
         .unwrap();

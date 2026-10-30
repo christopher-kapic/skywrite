@@ -9,3 +9,13 @@
 7. Assemble only approved assets in the edit, then validate and review the rendered sequence. Use upscaling only when an available backend explicitly supports that task; a generative higher-resolution edit is not automatically faithful upscaling.
 
 This is a workflow outline. It makes no claim that all generation or upscaling backends are installed. Never automatically execute saved prompts or skills.
+
+```sh
+skywrite generate image --model MODEL --prompt 'Original character design' --output character.png
+skywrite generate image --model MODEL --reference character.png --prompt 'Same character, another pose' --output pose.png
+skywrite generate video --model MODEL --first-frame character.png --prompt 'Animate this character'
+skywrite jobs resume JOB_ID --wait 60 --output shot.mp4
+skywrite upscale video --source-job JOB_ID --model UPSCALE_MODEL --factor 2
+```
+
+Discover supported parameters first. H3 Max accepts only one keyframe per request. Inspect character consistency visually. Resume existing jobs rather than automatically retrying an uncertain paid submit. Source-job upscale uses fresh signed URLs with stable content identity.

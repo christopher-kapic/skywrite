@@ -243,7 +243,7 @@ fn cached_word_transcription_uses_selected_source_time_and_rejects_stale_source(
     assert!(out.status.success());
     let info = skywrite::media::probe(&input).unwrap();
     let cache = temp.path().join("cache");
-    std::fs::create_dir(&cache).unwrap();
+    std::fs::create_dir_all(cache.join("responses")).unwrap();
     for (index, offset) in [1.0, 11.0].into_iter().enumerate() {
         let audio = temp.path().join(format!("chunk-{index}.wav"));
         skywrite::media::extract_audio(&info, &audio, offset, 10.0).unwrap();
@@ -258,7 +258,7 @@ fn cached_word_transcription_uses_selected_source_time_and_rejects_stale_source(
         let response =
             json!({"text":word,"words":[{"word":word,"start":0.25,"end":0.5}],"usage":{"cost":0}});
         std::fs::write(
-            cache.join(format!("{hash}.json")),
+            cache.join("responses").join(format!("{hash}.json")),
             serde_json::to_vec(&response).unwrap(),
         )
         .unwrap();

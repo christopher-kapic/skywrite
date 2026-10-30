@@ -56,6 +56,21 @@ enum Command {
     },
     /// Save ALL agent frustrations in ~/.skywrite/nits (never uploads).
     Nit { description: String },
+    /// Generate images/videos, with reference inputs and durable paid-job records.
+    Generate {
+        #[command(subcommand)]
+        command: skywrite::generation::GenerateCommand,
+    },
+    /// Inspect or resume generated media without repeating a paid submission.
+    Jobs {
+        #[command(subcommand)]
+        command: skywrite::generation::JobsCommand,
+    },
+    /// Dedicated AI video upscaling or explicit non-AI local image resizing.
+    Upscale {
+        #[command(subcommand)]
+        command: skywrite::generation::UpscaleCommand,
+    },
     /// Print agent-facing edit and transcript schemas/examples.
     Schema,
     /// Render still assets such as title cards using embedded upstream Takumi.
@@ -251,6 +266,7 @@ enum ModelCommand {
         task: String,
         model: String,
     },
+    /// Remove a saved task model default without making a paid request.
     UnsetDefault {
         #[arg(value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
         task: String,
@@ -315,6 +331,10 @@ fn finish(value: Value, output: &OutputOptions) -> Result<Value> {
 }
 fn execute(command: Command) -> Result<Value> {
     match command {
+        Command::Generate { command } => skywrite::generation::execute_generate(command),
+        Command::Jobs { command } => skywrite::generation::execute_jobs(command),
+        Command::Upscale { command } => skywrite::generation::execute_upscale(command),
+
         Command::Doctor => {
             let mut tools = serde_json::Map::new();
             for (tool, flag) in [
@@ -363,7 +383,10 @@ fn execute(command: Command) -> Result<Value> {
         }
         Command::Analyze(args) => {
             preflight_output(&args.output)?;
-            protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
+            let inputs: Vec<_> = std::iter::once(args.input.clone())
+                .chain(args.transcript.iter().cloned())
+                .collect();
+            protect_inputs(&args.output, &inputs)?;
             let info = skywrite::media::probe(&args.input)?;
             let model = if args.local {
                 None
@@ -395,6 +418,15 @@ fn execute(command: Command) -> Result<Value> {
                     prompt: args.prompt.as_deref(),
                 },
             )?;
+            // Cached sample files are inputs to the visual request as well.
+            protect_inputs(
+                &args.output,
+                &result
+                    .frames
+                    .iter()
+                    .map(|frame| frame.path.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             finish(serde_json::to_value(result)?, &args.output)
         }
         Command::Sync(args) => {
@@ -416,11 +448,16 @@ fn execute(command: Command) -> Result<Value> {
                 }
             };
             let result = if transcripts {
-                skywrite::sync::align_transcripts(
-                    &skywrite::transcript::Transcript::load(&args.reference)?,
-                    &skywrite::transcript::Transcript::load(&args.asset)?,
-                    &options,
-                )?
+                let reference = skywrite::transcript::Transcript::load(&args.reference)?;
+                let asset = skywrite::transcript::Transcript::load(&args.asset)?;
+                protect_inputs(
+                    &args.output,
+                    &[
+                        relative_input(&args.reference, &reference.source),
+                        relative_input(&args.asset, &asset.source),
+                    ],
+                )?;
+                skywrite::sync::align_transcripts(&reference, &asset, &options)?
             } else {
                 skywrite::sync::align_audio(&args.reference, &args.asset, &options)?
             };
@@ -435,21 +472,27 @@ fn execute(command: Command) -> Result<Value> {
                 to,
                 output,
                 overwrite,
-            } => skywrite::export::export(
-                &skywrite::timeline::load_and_validate(&file)?,
-                &to,
-                &output,
-                overwrite,
-            ),
+            } => {
+                skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
+                skywrite::export::export(
+                    &skywrite::timeline::load_and_validate(&file)?,
+                    &to,
+                    &output,
+                    overwrite,
+                )
+            }
             EditCommand::Render {
                 file,
                 output,
                 overwrite,
-            } => skywrite::export::render(
-                &skywrite::timeline::load_and_validate(&file)?,
-                &output,
-                overwrite,
-            ),
+            } => {
+                skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
+                skywrite::export::render(
+                    &skywrite::timeline::load_and_validate(&file)?,
+                    &output,
+                    overwrite,
+                )
+            }
             EditCommand::Suggest {
                 analysis,
                 brief,
@@ -539,15 +582,26 @@ fn suggest(
     if analyses.len() > 32 || brief.len() > 16 * 1024 {
         bail!("suggest supports at most 32 analyses and a 16-KiB brief");
     }
-    let model = skywrite::models::resolve_model("editing", model)?;
     let mut reports = Vec::new();
     let mut allowed = std::collections::HashSet::new();
+    let mut dependencies = Vec::new();
     for file in analyses {
         let report: skywrite::analysis::Analysis = skywrite::io::read_json(file)?;
         allowed.insert(skywrite::media::canonical_file(&report.media.path)?);
+        dependencies.extend(
+            report
+                .frames
+                .iter()
+                .map(|frame| relative_input(file, &frame.path)),
+        );
+        if let Some(transcript) = &report.transcript {
+            dependencies.push(relative_input(file, &transcript.source));
+        }
         reports.push(report);
     }
     protect_inputs(output, &allowed.iter().cloned().collect::<Vec<_>>())?;
+    protect_inputs(output, &dependencies)?;
+    let model = skywrite::models::resolve_model("editing", model)?;
     let encoded = serde_json::to_vec(&reports)?;
     if encoded.len() > 8 * 1024 * 1024 {
         bail!("combined analysis reports exceed eight MiB; select fewer sources/ranges");
@@ -609,13 +663,15 @@ fn schema() -> Value {
 }
 
 fn protect_inputs(output: &OutputOptions, inputs: &[PathBuf]) -> Result<()> {
-    if let Some(path) = output.output.as_ref().filter(|p| p.exists()) {
-        let destination = path.canonicalize()?;
-        for input in inputs {
-            if input.canonicalize().ok().as_ref() == Some(&destination) {
-                bail!("output would overwrite an input file; choose a different output path");
-            }
-        }
+    if let Some(path) = &output.output {
+        skywrite::io::protect_inputs(path, inputs)?;
     }
     Ok(())
+}
+fn relative_input(document: &Path, input: &Path) -> PathBuf {
+    if input.is_absolute() {
+        input.to_owned()
+    } else {
+        document.parent().unwrap_or(Path::new(".")).join(input)
+    }
 }

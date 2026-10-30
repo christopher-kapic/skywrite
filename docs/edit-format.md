@@ -73,10 +73,15 @@ skywrite edit export edit.json --to remotion --output remotion-project
 
 The Python script uses only the standard library and FFmpeg; it invokes FFmpeg
 with an argument list, never a shell. Both direct rendering and the script
-publish an H.264/AAC MP4. On POSIX, the script stops its owned FFmpeg process group on
+publish an H.264/AAC MP4. On Linux, the script stops its owned FFmpeg process group on
 ordinary SIGINT/SIGTERM cancellation, timeout, or failure before removing its
-private temporary output. Existing output files require `--overwrite`. Rendering
-or exporting over an original source is rejected. Exported project directories
+private temporary output. The leader is observed with `waitid(WNOWAIT)` and remains
+unreaped until the final group signal, preserving its process-group identity.
+Other POSIX platforms must provide these wait primitives or the script refuses
+to start FFmpeg; their runtime behavior has not been tested here. Existing output
+files require `--overwrite`. Input edit/transcript/analysis files and original
+media are protected even with that flag; an exported Python renderer also
+protects its own script. Exported project directories
 must be new even when `--overwrite` is supplied, preserving authored projects.
 
 FCPXML 1.10 uses file URLs and rational time values. A full-length primary gap

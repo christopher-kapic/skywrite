@@ -433,9 +433,12 @@ def cancel(signum, frame):
 
 def run_ffmpeg(args):
     child = None
+    group_owner = os.name == 'posix'
+    if group_owner and not all(hasattr(os, name) for name in ('waitid', 'WNOWAIT', 'WEXITED', 'WNOHANG', 'P_PID')):
+        raise RuntimeError('safe process-group ownership requires waitid(WNOWAIT) on this platform')
     try:
         child = subprocess.Popen(['ffmpeg', *args], stdin=subprocess.DEVNULL,
-                                 start_new_session=(os.name == 'posix'))
+                                 start_new_session=group_owner)
         deadline = time.monotonic() + PLAN['timeout_seconds']
         while True:
             if CANCELLED is not None:
@@ -443,33 +446,43 @@ def run_ffmpeg(args):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(child.args, PLAN['timeout_seconds'])
-            try:
-                code = child.wait(timeout=min(0.1, remaining))
+            if group_owner:
+                # Observe without reaping: the leader PID reserves the group
+                # identity until every group signal in finally has completed.
+                observed = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                code = None if observed is None else (observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status)
+            else:
+                # Windows Popen retains a process handle, not a recycled PGID.
+                code = child.poll()
+            if code is not None:
                 if CANCELLED is not None:
                     raise SystemExit(128 + CANCELLED)
                 if code:
                     raise subprocess.CalledProcessError(code, child.args)
                 return
-            except subprocess.TimeoutExpired:
-                if time.monotonic() >= deadline:
-                    raise
+            time.sleep(min(0.01, remaining))
     finally:
         if child is not None:
             # Descendants may still hold the output open after the leader exits.
             # Complete group cleanup before unlinking/publishing private output.
             def terminate(sig):
                 try:
-                    if os.name == 'posix':
+                    if group_owner:
                         os.killpg(child.pid, sig)
                     elif child.poll() is None:
                         child.kill() if sig == getattr(signal, 'SIGKILL', None) else child.terminate()
                 except ProcessLookupError:
                     pass
             terminate(signal.SIGTERM)
-            try:
-                child.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                pass
+            if group_owner:
+                # Do not call poll/wait before the final group signal: either
+                # one can release the leader identity even after normal exit.
+                time.sleep(0.05)
+            else:
+                try:
+                    child.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pass
             terminate(getattr(signal, 'SIGKILL', signal.SIGTERM))
             child.wait()
 
@@ -479,8 +492,9 @@ def main():
     parser.add_argument('--overwrite', action='store_true')
     options = parser.parse_args()
     output = Path(options.output).absolute()
-    if output.resolve() in [Path(source).resolve() for source in PLAN['sources']]:
-        raise ValueError('output must not replace original source media')
+    protected = [Path(__file__).resolve()] + [Path(source).resolve() for source in PLAN['sources']]
+    if output.resolve() in protected:
+        raise ValueError('output must not replace an input renderer script or original source media')
     if output.exists() and not options.overwrite:
         raise FileExistsError('output exists; pass --overwrite')
     handlers = {{sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM)}}

@@ -33,14 +33,14 @@ fn excessive_cached_response_stops_cli_and_preserves_source_and_output() {
     skywrite::media::extract_audio(&info, &chunk, 0., 10.).unwrap();
     let request = json!({"model":"budget-fixture", "input_audio":{"data":STANDARD.encode(std::fs::read(&chunk).unwrap()),"format":"wav"},"response_format":"verbose_json","timestamp_granularities":["word"]});
     let cache = dir.path().join("cache");
-    std::fs::create_dir(&cache).unwrap();
+    std::fs::create_dir_all(cache.join("responses")).unwrap();
     let hash = skywrite::openrouter::cache_key(&[
         b"https://openrouter.ai/api/v1",
         b"audio/transcriptions",
         &serde_json::to_vec(&request).unwrap(),
     ]);
     // Sparse, owned file: first excess byte of the real 8MiB response/cache cap.
-    std::fs::File::create(cache.join(format!("{hash}.json")))
+    std::fs::File::create(cache.join("responses").join(format!("{hash}.json")))
         .unwrap()
         .set_len(8 * 1024 * 1024 + 1)
         .unwrap();

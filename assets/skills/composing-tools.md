@@ -9,3 +9,5 @@
 7. Record every tool frustration with `skywrite nit 'description'`. Include only details intended for sharing; the command saves your text locally and does not upload it.
 
 A saved skill is a procedural document. Reading it never runs commands or starts model calls. Generation/upscaling availability is determined by the installed CLI help; this outline does not promise a particular backend.
+
+A mixed workflow uses `image render` for typography, `generate image --reference` for a character pose, `generate video --first-frame` for motion, then `jobs resume` to retrieve it. Place graphics and generated clips together in edit JSON. AI video upscaling uses `upscale video --source-job JOB_ID`; local image resizing uses `upscale image INPUT --output OUTPUT.png` and is non-AI. Retain job IDs/provenance to resume rather than re-spend.
