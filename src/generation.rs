@@ -595,6 +595,10 @@ fn validate_public_url(url: &url::Url) -> Result<()> {
     }
     Ok(())
 }
+// Conservative subset of globally reachable unicast. See the checked-in IANA
+// registries (retrieved 2026-10-30) and endpoint table under tests/fixtures/network.
+// Entire special-use parent ranges may be denied even when they contain globally
+// reachable exceptions; mapped/NAT64/6to4/Teredo addresses remain denied.
 fn public_address(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
@@ -608,7 +612,7 @@ fn public_address(ip: std::net::IpAddr) -> bool {
                 || o[0] >= 240
                 || o[0] == 127
                 || o[0] == 100 && (64..=127).contains(&o[1])
-                || o[0] == 192 && o[1] == 0
+                || o[0] == 192 && (o[1] == 0 || o[1] == 88 && o[2] == 99)
                 || o[0] == 198 && (o[1] == 18 || o[1] == 19)
                 || o[0] == 198 && o[1] == 51 && o[2] == 100
                 || o[0] == 203 && o[1] == 0 && o[2] == 113)
@@ -617,6 +621,7 @@ fn public_address(ip: std::net::IpAddr) -> bool {
             let s = ip.segments();
             (s[0] & 0xe000) == 0x2000
                 && s[0] != 0x2002
+                && !(s[0] == 0x3fff && s[1] < 0x1000)
                 && !(s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0x0db8))
         }
     }
@@ -624,19 +629,33 @@ fn public_address(ip: std::net::IpAddr) -> bool {
 fn public_download_client(url: &url::Url) -> Result<Client> {
     use std::net::ToSocketAddrs;
     validate_public_url(url)?;
-    let host = url.host_str().context("missing content host")?;
-    let addresses = (host, 443).to_socket_addrs()?.collect::<Vec<_>>();
+    let host = url.host().context("missing content host")?;
+    // URL's typed host avoids treating brackets around an IPv6 literal as DNS.
+    let addresses = match host {
+        url::Host::Ipv4(ip) => vec![std::net::SocketAddr::new(ip.into(), 443)],
+        url::Host::Ipv6(ip) => vec![std::net::SocketAddr::new(ip.into(), 443)],
+        url::Host::Domain(name) => (name, 443).to_socket_addrs()?.collect::<Vec<_>>(),
+    };
     if addresses.is_empty() || addresses.iter().any(|a| !public_address(a.ip())) {
         bail!("nonpublic video download address rejected");
     }
-    Ok(Client::builder()
+    Ok(pinned_download_builder(&host.to_string(), &addresses).build()?)
+}
+// Production calls this only after the complete resolved set passes admission.
+// Tests exercise this same socket/TLS boundary with owned loopback addresses and
+// a test root certificate, independently of the pure global-address guard.
+fn pinned_download_builder(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> reqwest::blocking::ClientBuilder {
+    Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .resolve_to_addrs(host, &addresses)
-        .build()?)
+        .resolve_to_addrs(host, addresses)
 }
+
 fn prompt_check(prompt: &str) -> Result<()> {
     if prompt.trim().is_empty() || prompt.len() > 32 * 1024 {
         bail!("prompt must contain 1..32768 bytes");
@@ -2036,6 +2055,251 @@ impl Transport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_address_registry_endpoints_and_inverse() {
+        let table = include_str!("../tests/fixtures/network/endpoints.txt");
+        let mut count = 0;
+        for line in table.lines().filter(|line| !line.starts_with('#')) {
+            let cells: Vec<_> = line.split_whitespace().collect();
+            for address in &cells[1..=2] {
+                assert_eq!(
+                    public_address(address.parse().unwrap()),
+                    cells[3] == "true",
+                    "{} ({})",
+                    address,
+                    cells[0]
+                );
+            }
+            count += 1;
+        }
+        assert_eq!(count, 51);
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "192.1.0.1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "3fff:1000::",
+        ] {
+            assert!(public_address(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:8.8.8.8",
+            "2002:808:808::",
+            "64:ff9b::808:808",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!public_address(address.parse().unwrap()), "{address}");
+        }
+        for raw in [
+            "http://example.com/",
+            "https://user:pass@example.com/",
+            "https://example.com:444/",
+            "https://example.com/#fragment",
+            "https://localhost/",
+            "https://x.localhost/",
+        ] {
+            assert!(
+                validate_public_url(&url::Url::parse(raw).unwrap()).is_err(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://127.0.0.1/",
+            "https://2130706433/",
+            "https://0x7f000001/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+        ] {
+            let error = public_download_client(&url::Url::parse(raw).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("nonpublic"), "{raw}: {error}");
+        }
+        let v6 = url::Url::parse("https://[2606:4700:4700::1111]/").unwrap();
+        assert!(matches!(v6.host(), Some(url::Host::Ipv6(_))));
+        assert!(public_download_client(&v6).is_ok()); // Builds only; no request.
+    }
+
+    // A bounded owned Python TLS server. Drop always kills/reaps the fixture.
+    struct OwnedTls {
+        child: std::process::Child,
+        address: std::net::SocketAddr,
+    }
+    impl Drop for OwnedTls {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    impl OwnedTls {
+        fn start(ip: &str, port: u16) -> Self {
+            Self::start_with_certificate(ip, port, "test-server.pem")
+        }
+        fn start_with_certificate(ip: &str, port: u16, certificate: &str) -> Self {
+            use std::io::BufRead;
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network");
+            let mut child = std::process::Command::new("python3")
+                .arg(base.join("tls_server.py"))
+                .arg(base.join(certificate))
+                .arg(base.join("test-server.key"))
+                .arg(ip)
+                .arg(port.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let address =
+                std::net::SocketAddr::new(ip.parse().unwrap(), line.trim().parse().unwrap());
+            Self { child, address }
+        }
+        fn client(&self, host: &str) -> Client {
+            let cert = reqwest::Certificate::from_pem(include_bytes!(
+                "../tests/fixtures/network/test-ca.pem"
+            ))
+            .unwrap();
+            pinned_download_builder(host, &[self.address])
+                .tls_certs_merge([cert])
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        }
+    }
+    #[test]
+    fn pinned_download_owned_tls_socket_and_certificate_boundary() {
+        // localhost has a real fallback address. With trusted matching TLS,
+        // a forbidden resolver fallback would turn the wrong-pin failure into
+        // success against this live server.
+        let fallback = OwnedTls::start("127.0.0.1", 0);
+        let fallback_url = format!("https://localhost:{}/", fallback.address.port());
+        assert!(
+            fallback
+                .client("localhost")
+                .get(&fallback_url)
+                .send()
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let unavailable =
+            std::net::SocketAddr::new("127.0.0.2".parse().unwrap(), fallback.address.port());
+        let cert =
+            reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/network/test-ca.pem"))
+                .unwrap();
+        let no_fallback = pinned_download_builder("localhost", &[unavailable])
+            .tls_certs_merge([cert])
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(no_fallback.get(&fallback_url).send().is_err());
+        let first = OwnedTls::start("127.0.0.1", 0);
+        let port = first.address.port();
+        let second = OwnedTls::start("127.0.0.2", port);
+        let domain_url = format!("https://pinned.invalid:{port}/");
+        let client = first.client("pinned.invalid");
+        assert_eq!(
+            client.get(&domain_url).send().unwrap().text().unwrap(),
+            "ok"
+        );
+        // Rebuilding with the same origin but a different address reaches server 2.
+        // Killing server 1 ensures an old pool or ignored new pin cannot pass.
+        drop(first);
+        assert!(client.get(&domain_url).send().is_err());
+        assert_eq!(
+            second
+                .client("pinned.invalid")
+                .get(&domain_url)
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "ok"
+        );
+        let redirect = second
+            .client("pinned.invalid")
+            .get(format!("https://pinned.invalid:{port}/redirect"))
+            .send()
+            .unwrap();
+        assert_eq!(redirect.status(), reqwest::StatusCode::FOUND);
+        // A wrong pin must fail even while a valid same-port loopback server exists.
+        let wrong: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let cert =
+            reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/network/test-ca.pem"))
+                .unwrap();
+        let wrong_client = pinned_download_builder("pinned.invalid", &[wrong])
+            .tls_certs_merge([cert])
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(wrong_client.get(&domain_url).send().is_err());
+        assert!(
+            second
+                .client("mismatch.invalid")
+                .get(format!("https://mismatch.invalid:{port}/"))
+                .send()
+                .is_err()
+        );
+        assert_eq!(
+            second
+                .client("127.0.0.2")
+                .get(format!("https://127.0.0.2:{port}/"))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let v6 = OwnedTls::start("::1", 0);
+        assert_eq!(
+            v6.client("::1")
+                .get(format!("https://[::1]:{}/", v6.address.port()))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        for ip in ["127.0.0.1", "::1"] {
+            let mismatched = OwnedTls::start_with_certificate(ip, 0, "test-mismatch.pem");
+            let literal = if ip.contains(':') {
+                format!("[{ip}]")
+            } else {
+                ip.to_owned()
+            };
+            assert!(
+                mismatched
+                    .client(ip)
+                    .get(format!("https://{literal}:{}/", mismatched.address.port()))
+                    .send()
+                    .is_err()
+            );
+            // Same certificate and socket succeed for its DNS SAN: rejection
+            // above is specifically the missing IP SAN, not broken trust/I/O.
+            assert_eq!(
+                mismatched
+                    .client("mismatch.invalid")
+                    .get(format!(
+                        "https://mismatch.invalid:{}/",
+                        mismatched.address.port()
+                    ))
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        // Name mismatch remains rejected on an IPv6 connection.
+        assert!(
+            v6.client("mismatch.invalid")
+                .get(format!("https://mismatch.invalid:{}/", v6.address.port()))
+                .send()
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
