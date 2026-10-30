@@ -326,6 +326,78 @@ assert all('file://' in x.attrib['src'] for x in r.findall('.//media-rep'))
 }
 
 #[test]
+fn hyperframes_html_excludes_human_metadata_and_preserves_edit_data() {
+    let dir = tempfile::tempdir().unwrap();
+    make_fixtures(dir.path());
+    let mut specification = edit();
+    specification.name = "Ordinary edit".into();
+    let ordinary = timeline::validate(&specification, dir.path()).unwrap();
+    let ordinary_project = dir.path().join("ordinary");
+    export::export(&ordinary, "hyperframes", &ordinary_project, false).unwrap();
+    let expected_html = fs::read_to_string(ordinary_project.join("index.html")).unwrap();
+    assert!(expected_html.contains("<title>Skywrite composition</title>"));
+    assert!(expected_html.contains("alt=\"Image\""));
+    for original in [
+        "Ordinary edit",
+        "title.png",
+        "green.mp4",
+        "voice.wav",
+        "<take>",
+    ] {
+        assert!(!expected_html.contains(original), "HTML leaked {original}");
+    }
+
+    // Harmless markup-shaped text exercises downstream rewrite-sensitive
+    // characters without adding executable content to any runtime fixture.
+    let renamed_image = "封面 'quoted' & <caption>.png";
+    fs::rename(dir.path().join("title.png"), dir.path().join(renamed_image)).unwrap();
+    specification.clips[3].source = Some(renamed_image.into());
+    for (index, name) in [
+        "A 'quoted' & <caption> Ω 🎬",
+        "Escaped-looking &lt;caption&gt; &amp; &#34; text",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        specification.name = name.into();
+        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        let project = dir.path().join(format!("text-{index}"));
+        export::export(&validated, "hyperframes", &project, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(project.join("index.html")).unwrap(),
+            expected_html,
+            "human metadata must not influence executable HTML"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(project.join("edit.validated.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["name"], name);
+        assert!(
+            saved["clips"][3]["source"]
+                .as_str()
+                .unwrap()
+                .ends_with(renamed_image)
+        );
+        assert_eq!(saved["duration_frames"], 45);
+        for (asset, original) in [
+            ("asset-0000.mp4", "speaker's $(touch HACKED) & <take>.mp4"),
+            ("asset-0001.mp4", "green.mp4"),
+            ("asset-0002.png", renamed_image),
+            ("asset-0003.wav", "voice.wav"),
+        ] {
+            assert_eq!(
+                fs::read(project.join("assets").join(asset)).unwrap(),
+                fs::read(dir.path().join(original)).unwrap()
+            );
+        }
+    }
+    let ordinary_data: serde_json::Value =
+        serde_json::from_slice(&fs::read(ordinary_project.join("edit.validated.json")).unwrap())
+            .unwrap();
+    assert_eq!(ordinary_data["name"], "Ordinary edit");
+}
+
+#[test]
 fn delayed_stream_presentation_times_survive_trim_and_retime() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("delayed.mkv");

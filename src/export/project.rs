@@ -1,5 +1,5 @@
 //! Optional HTML/React composition projects. Original media are copied, never linked.
-use super::{number, xml};
+use super::number;
 use crate::{
     media,
     timeline::{MediaKind, ValidatedEdit},
@@ -83,11 +83,13 @@ pub(super) fn export(edit: &ValidatedEdit, target: &str, output: &Path) -> Resul
 }
 
 fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>) -> Result<()> {
+    // Hyperframes rewrites this HTML before rendering. Keep human names only in
+    // edit.validated.json: even escaped presentation text need not cross that
+    // executable-document boundary. Media references use generated asset IDs.
     let mut html = format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width={}, height={}\"><title>{}</title>\n<script src=\"https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js\"></script>\n<style>*{{box-sizing:border-box;margin:0}}html,body{{width:{}px;height:{}px;overflow:hidden;background:#000}}.clip{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}}#root{{position:relative;width:100%;height:100%;background:#000}}</style></head><body>\n<div id=\"root\" data-composition-id=\"main\" data-start=\"0\" data-duration=\"{}\" data-width=\"{}\" data-height=\"{}\" data-fps=\"{}\">\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width={}, height={}\"><title>Skywrite composition</title>\n<script src=\"https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js\"></script>\n<style>*{{box-sizing:border-box;margin:0}}html,body{{width:{}px;height:{}px;overflow:hidden;background:#000}}.clip{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}}#root{{position:relative;width:100%;height:100%;background:#000}}</style></head><body>\n<div id=\"root\" data-composition-id=\"main\" data-start=\"0\" data-duration=\"{}\" data-width=\"{}\" data-height=\"{}\" data-fps=\"{}\">\n",
         edit.width,
         edit.height,
-        xml(&edit.name),
         edit.width,
         edit.height,
         number(edit.duration()),
@@ -107,14 +109,7 @@ fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, Stri
         );
         let src = format!("assets/{}", sources[source]);
         if clip.kind == MediaKind::Image {
-            writeln!(
-                html,
-                "<img {common} src=\"{src}\" alt=\"{}\">",
-                xml(source
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Image"))
-            )?;
+            writeln!(html, "<img {common} src=\"{src}\" alt=\"Image\">")?;
         } else {
             writeln!(
                 html,
