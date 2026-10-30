@@ -1,12 +1,12 @@
 # Skywrite
 
-A Rust CLI that gives coding agents a structured view of local media and a small edit format they can validate, render, or export. It uses FFmpeg/ffprobe directly. OpenRouter powers optional transcription, media understanding, and edit suggestions. Hyperframes, Remotion, and Takumi are optional output tools.
+A Rust CLI that gives coding agents a structured view of local media and a small edit format they can validate, render, or export. It uses FFmpeg/ffprobe directly. OpenRouter powers optional transcription, media understanding, and edit suggestions. Hyperframes and Remotion are optional output tools. Upstream Takumi is embedded for native still graphics.
 
 This is an assembly editor: source selection, in points, order, gaps, stills, constant speeds, and audio overlays. Finish detailed transitions, titles, grading, and effects in your NLE or exported composition project.
 
 ## Build
 
-Rust 1.88 or newer, FFmpeg, and ffprobe are required. FFmpeg must include H.264 (`libx264`) and AAC encoding for the built-in MP4 renderer.
+Rust 1.91 or newer, FFmpeg, and ffprobe are required. FFmpeg must include H.264 (`libx264`) and AAC encoding for the built-in MP4 renderer.
 
 ```sh
 cargo build --release --locked
@@ -34,7 +34,7 @@ skywrite analyze camera-a.mp4 --model YOUR_VISION_MODEL --prompt 'Find useful in
 skywrite analyze recorder.wav --model YOUR_AUDIO_CAPABLE_MODEL --transcript recorder.transcript.json -o recorder.analysis.json
 ```
 
-Transcription uses OpenRouter's `/audio/transcriptions`, requests `verbose_json` with word timestamps, and sends bounded 16-kHz mono WAV chunks (60 seconds by default; adjustable from 10–120). Responses lacking actual word timestamps are rejected instead of estimating word positions. Chunk timestamps are shifted into source time, preserving any initial audio-stream delay. Generated transcripts include a source-content SHA-256 fingerprint; analysis rejects them if the source content changes. Manually supplied transcripts without fingerprints are accepted and marked unverified in the coverage report. Text can lose context at chunk boundaries; inspect important edits around those boundaries.
+Transcription uses OpenRouter's `/audio/transcriptions`, requests `verbose_json` with word timestamps, and sends bounded 16-kHz mono WAV chunks (60 seconds by default; adjustable from 10–120). Responses lacking actual word timestamps are rejected instead of estimating word positions. Chunk timestamps are shifted into source time, preserving any initial audio-stream delay. If a provider returns words out of order, Skywrite sorts them stably by their actual start times, preserving concurrent words and the provider transcript text; stderr and `usage.word_ordering` report any reordering. Generated transcripts include a source-content SHA-256 fingerprint; analysis rejects them if the source content changes. Manually supplied transcripts without fingerprints are accepted and marked unverified in the coverage report. Text can lose context at chunk boundaries; inspect important edits around those boundaries.
 
 `--start SECONDS --duration SECONDS` limits the selected range for transcription and analysis. Transcription word positions remain relative to the full source, including that starting offset. A transcript supplied to `analyze --transcript` must reference the same source file. Audio-only remote analysis without a transcript sends at most the first 60 seconds of the chosen range and labels that coverage. Video analysis sends sampled frames; include a transcript to supply dialogue.
 
@@ -121,13 +121,20 @@ skywrite edit export edit.json --to remotion -o remotion-project
 
 Unsupported target behavior is reported rather than silently discarded. Exported projects are starting points an agent can extend with graphics and effects; the shared assembly format intentionally stays small.
 
-## Still graphics with an external Takumi CLI (optional adapter)
+## Native still graphics with upstream Takumi
 
 ```sh
-skywrite image render --backend takumi-cli --file title.html -o title.png --width 1280 --height 720
+skywrite image render --file title.html -o title.png --width 1280 --height 720
+skywrite image render --file card.json -o card.webp --quality 90 --font ./Brand.ttf
 ```
 
-This adapter explicitly calls whichever external `takumi` CLI is on PATH. In this workspace that is an older fork; this initial pass does not embed the current original upstream Takumi implementation. It uses direct arguments, checks the actual output dimensions, and publishes the image atomically. Supported formats are PNG, WebP, and JPEG, with `--quality 0..100` and repeated `--font GLOB` for local fonts. The format is inferred from the output extension unless supplied explicitly. Include the resulting image in the edit's primary clips. Takumi HTML/JSON and any referenced images/fonts follow Takumi's own supported input behavior.
+The default renderer embeds original upstream `takumi = 2.19.0` with its `from-html` feature, not a CLI fork. No external Takumi executable, browser, FFmpeg, or system fonts are needed for this command. Rust 1.91 or newer is required to build Skywrite. An unmodified Geist variable font is embedded under its [SIL Open Font License](assets/fonts/OFL.txt); use repeated `--font PATH` to register extra local font files. Select their family in your template. Glyph coverage follows the registered fonts.
+
+Templates are `.html`/`.htm` fragments or upstream Takumi JSON nodes, for example `{"type":"text","text":"Hello","style":{"fontSize":48,"color":"white"}}`. HTML supports upstream inline `style` and `tw` attributes. The stable upstream HTML entry point discards stylesheet elements, so Skywrite rejects `<style>`/`<link>` inputs with guidance to use inline styles. HTML error recovery follows upstream; this is a layout renderer with no JavaScript execution. PNG preserves alpha; WebP/JPEG accept `--quality 0..100` (default 75); PNG rejects quality because it is lossless. The format is inferred from the output extension unless supplied explicitly.
+
+Image-node `src` paths resolve relative to the template. Only local raster images are supported; remote URLs, data URIs, inline image buffers and SVG sources are unsupported. CSS background image resources are outside this interface. Rendering makes no network requests. Templates are limited to one MiB, 4096 rendered nodes and depth 64, with at most 16 megapixels on a canvas whose sides are 1..8192. Local images have the same per-image pixel budget and at most 32 megapixels combined; each font/image is at most 16 MiB, with 32 MiB combined resource bytes, at most 64 image resources and sixteen extra fonts. These are input bounds, not a hard operating-system memory or CPU quota.
+
+Native outputs are published atomically, existing files require `--overwrite`, and the template, loaded fonts and loaded images cannot be replaced by the output. Include resulting stills in the edit's primary clips. `--backend takumi-cli` retains an explicit compatibility adapter for whichever external `takumi` is on PATH; it follows that CLI's input behavior and is not required for native rendering.
 
 ## Validation
 

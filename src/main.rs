@@ -41,7 +41,7 @@ enum Command {
     },
     /// Print agent-facing edit and transcript schemas/examples.
     Schema,
-    /// Render still assets such as title cards through the optional Takumi CLI.
+    /// Render still assets such as title cards using embedded upstream Takumi.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -195,8 +195,8 @@ enum ImageCommand {
         font: Vec<String>,
         #[arg(long)]
         overwrite: bool,
-        /// Explicit external adapter; current upstream native rendering is not included.
-        #[arg(long,default_value="takumi-cli",value_parser=["takumi-cli"])]
+        /// Native upstream renderer, or an explicit external compatibility adapter.
+        #[arg(long,default_value="native",value_parser=["native","takumi-cli"])]
         backend: String,
     },
 }
@@ -280,7 +280,7 @@ fn execute(command: Command) -> Result<Value> {
                 tools.insert(tool.to_owned(),match result {Ok(out)=>json!({"available":true,"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")}),Err(error)=>json!({"available":false,"reason":error.to_string()})});
             }
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)","takumi"]}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)","takumi (explicit legacy adapter)"],"native_image_renderer":{"name":"takumi","version":"2.19.0","available":true}}),
             )
         }
         Command::Inspect { inputs, output } => {
@@ -412,7 +412,7 @@ fn execute(command: Command) -> Result<Value> {
                 quality,
                 font,
                 overwrite,
-                backend: _,
+                backend,
             } => skywrite::image::render(&skywrite::image::RenderImage {
                 file: &file,
                 output: &output,
@@ -421,6 +421,7 @@ fn execute(command: Command) -> Result<Value> {
                 format: format.as_deref(),
                 quality,
                 fonts: &font,
+                backend: &backend,
                 overwrite,
             }),
         },
