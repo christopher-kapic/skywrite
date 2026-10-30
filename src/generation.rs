@@ -205,6 +205,17 @@ fn remote_id(id: &str) -> Result<()> {
 fn jobs_root() -> Result<PathBuf> {
     Ok(crate::workspace::personal_home()?.join("jobs"))
 }
+// Unknown job state must never be mistaken for absence. Inspect the entry
+// itself so dangling/special records also reach the validating job reader.
+fn job_path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting job state {}", path.display()))
+        }
+    }
+}
 fn open_regular(path: &Path, create: bool) -> Result<File> {
     let mut options = OpenOptions::new();
     options
@@ -1072,7 +1083,7 @@ fn submit_with_upload(
         .and_then(|r| r["cleanup_requested"].as_bool())
         .unwrap_or(false);
     let (dir, _lock) = locked_job(&id)?;
-    let mut job = if dir.join("job.json").exists() {
+    let mut job = if job_path_exists(&dir.join("job.json"))? {
         load_job(&dir)?
     } else {
         let now = timestamp()?;
@@ -1424,8 +1435,11 @@ pub(crate) fn active_storage_uploads(
 ) -> Result<std::collections::HashSet<String>> {
     let root = jobs_root()?;
     let mut active = std::collections::HashSet::new();
-    if !root.exists() {
+    if !job_path_exists(&root)? {
         return Ok(active);
+    }
+    if !fs::symlink_metadata(&root)?.is_dir() {
+        bail!("generation jobs root must be a non-symlink directory");
     }
     for (index, entry) in fs::read_dir(root)?.enumerate() {
         if index >= 10000 {
@@ -1434,11 +1448,17 @@ pub(crate) fn active_storage_uploads(
         let entry = entry?;
         let name = entry.file_name();
         let Some(id) = name.to_str() else { continue };
-        if exclude == Some(id)
-            || valid_id(id).is_err()
-            || !entry.file_type()?.is_dir()
-            || !entry.path().join("job.json").exists()
-        {
+        if exclude == Some(id) || valid_id(id).is_err() {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            bail!(
+                "cannot inspect symlink generation job directory {}",
+                entry.path().display()
+            );
+        }
+        if !kind.is_dir() || !job_path_exists(&entry.path().join("job.json"))? {
             continue;
         }
         let job = load_job(&entry.path())?;
@@ -1518,7 +1538,7 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
     match command {
         JobsCommand::List => {
             let root = jobs_root()?;
-            if !root.exists() {
+            if !job_path_exists(&root)? {
                 return Ok(json!({"jobs":[]}));
             }
             let mut jobs = Vec::new();
@@ -1531,7 +1551,7 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 let Some(id) = name.to_str() else { continue };
                 if valid_id(id).is_ok()
                     && entry.file_type()?.is_dir()
-                    && entry.path().join("job.json").exists()
+                    && job_path_exists(&entry.path().join("job.json"))?
                 {
                     let job = load_job(&entry.path())?;
                     jobs.push(json!({"id":job.id,"task":job.task,"model":job.model,"status":job.status,"created_at":job.created_at}));

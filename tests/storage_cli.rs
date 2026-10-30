@@ -139,3 +139,169 @@ fn local_config_and_upload_plans_never_need_cloud_credentials() {
     );
     assert!(!onlyflag.status.success());
 }
+
+#[test]
+fn local_job_scan_fails_closed_before_cloud_and_cleanup() {
+    use base64::Engine;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    success(cli(
+        home,
+        &[
+            "storage",
+            "configure",
+            "--endpoint",
+            "https://example.com",
+            "--bucket",
+            "test-bucket",
+            "--public-base-url",
+            "https://assets.example.com",
+        ],
+    ));
+    let purge = |dry_run: bool| {
+        let args = if dry_run {
+            vec!["storage", "purge", "--dry-run"]
+        } else {
+            vec!["storage", "purge"]
+        };
+        let out = cli(home, &args);
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let allowed = || {
+        assert!(
+            purge(true).contains("AWS_ACCESS_KEY_ID"),
+            "legitimate absence must reach credential validation"
+        )
+    };
+    let blocked = |expected: &str| {
+        for dry_run in [true, false] {
+            let error = purge(dry_run);
+            assert!(error.contains(expected), "expected {expected}: {error}");
+            assert!(
+                !error.contains("AWS_ACCESS_KEY_ID"),
+                "guard must precede cloud creation: {error}"
+            );
+        }
+    };
+    allowed(); // Genuinely missing jobs root.
+    let jobs = home.join("jobs");
+    let other = jobs.join("a".repeat(64));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(jobs.join("unrelated")).unwrap();
+    std::fs::write(jobs.join("b".repeat(64)), "not a job directory").unwrap();
+    allowed(); // Empty valid-ID and unrelated directories are not job records.
+    let record = other.join("job.json");
+    std::fs::write(&record, "{}").unwrap();
+    blocked("missing field");
+    let override_result = cli(home, &["storage", "purge", "--dry-run", "--include-active"]);
+    assert!(String::from_utf8_lossy(&override_result.stderr).contains("AWS_ACCESS_KEY_ID"));
+
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(home.join("storage.json")).unwrap()).unwrap();
+    let hash = "c".repeat(64);
+    let upload = json!({"config":config,"key":format!("skywrite/uploads/{hash}.mp4"),"sha256":hash,"bytes":1,"media_type":"video/mp4"});
+    let make_job = |id: &str, status: &str, artifact: Value| json!({"version":1,"id":id,"task":"image-generation","model":"test/model","status":status,"created_at":1,"updated_at":1,"request":{},"references":[{"storage_upload":upload,"cleanup_requested":true}],"remote_id":null,"generation_id":null,"usage":null,"artifact":artifact,"error":null});
+    let id = "d".repeat(64);
+    let completed = jobs.join(&id);
+    std::fs::create_dir(&completed).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQZkAAAAASUVORK5CYII=").unwrap();
+    let result = completed.join("result.png");
+    std::fs::write(&result, &bytes).unwrap();
+    let artifact = json!({"file":"result.png","sha256":skywrite::media::file_sha256(&result).unwrap(),"bytes":bytes.len(),"media_type":"image/png","decode_validation_version":1});
+    let completed_job = make_job(&id, "completed", artifact.clone());
+    let resume = || {
+        std::fs::write(
+            completed.join("job.json"),
+            serde_json::to_vec(&completed_job).unwrap(),
+        )
+        .unwrap();
+        success(cli(home, &["jobs", "resume", &id]))
+    };
+    let failed = resume();
+    assert_eq!(failed["references"][0]["cleanup_status"], "failed");
+    assert!(
+        failed["references"][0]["cleanup_error"]
+            .as_str()
+            .unwrap()
+            .contains("missing field")
+    );
+
+    // Exercise the shared deletion boundary's inverse: every unfinished state
+    // retains the source; terminal records allow credential validation to proceed.
+    for state in [
+        "prepared",
+        "submitting",
+        "uncertain",
+        "received",
+        "pending",
+        "in_progress",
+        "ready",
+        "failed",
+        "rejected",
+        "completed",
+    ] {
+        let mut job = make_job(&"a".repeat(64), state, artifact.clone());
+        job["remote_id"] = json!("provider-id");
+        std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+        let value = resume();
+        let reference = &value["references"][0];
+        if matches!(state, "failed" | "rejected" | "completed") {
+            assert_eq!(reference["cleanup_status"], "failed", "{state}");
+            assert!(
+                reference["cleanup_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("AWS_ACCESS_KEY_ID"),
+                "{state}: {reference}"
+            );
+        } else {
+            assert_eq!(
+                reference["cleanup_status"], "deferred_active_job",
+                "{state}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        std::fs::remove_file(&record).unwrap();
+        symlink(other.join("missing-record"), &record).unwrap();
+        blocked("opening"); // A dangling record is existing invalid state.
+        std::fs::remove_file(&record).unwrap();
+        std::fs::remove_dir(&other).unwrap();
+        symlink(jobs.join("unrelated"), &other).unwrap();
+        blocked("symlink generation job directory");
+        std::fs::remove_file(&other).unwrap();
+        let archived = home.join("archived-jobs");
+        std::fs::rename(&jobs, &archived).unwrap();
+        symlink(&archived, &jobs).unwrap();
+        blocked("jobs root must be a non-symlink directory");
+        std::fs::remove_file(&jobs).unwrap();
+        std::fs::write(&jobs, "not a directory").unwrap();
+        blocked("jobs root must be a non-symlink directory");
+        std::fs::remove_file(&jobs).unwrap();
+        std::fs::rename(&archived, &jobs).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(&record, "{}").unwrap();
+        // Root bypasses Unix DAC, so chmod cannot create a permission fault there.
+        if unsafe { libc::geteuid() } != 0 {
+            for path in [&record, &other, &jobs] {
+                let original = std::fs::metadata(path).unwrap().permissions();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0)).unwrap();
+                blocked("Permission denied");
+                if path != &jobs {
+                    let value = resume();
+                    assert_eq!(value["references"][0]["cleanup_status"], "failed");
+                    let error = value["references"][0]["cleanup_error"].as_str().unwrap();
+                    assert!(error.contains("Permission denied"), "{error}");
+                    assert!(!error.contains("AWS_ACCESS_KEY_ID"), "{error}");
+                }
+                std::fs::set_permissions(path, original).unwrap();
+            }
+        } else {
+            eprintln!("permission-only cases skipped: root bypasses Unix DAC");
+        }
+    }
+}
