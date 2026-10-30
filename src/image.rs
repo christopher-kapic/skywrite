@@ -25,6 +25,10 @@ pub struct RenderImage<'a> {
     pub quality: Option<u8>,
     /// Individual local font files for native rendering.
     pub fonts: &'a [String],
+    /// Explicit Google Fonts CSS2 families/axis selectors; no template text is sent.
+    pub google_fonts: &'a [String],
+    pub cache_dir: Option<&'a Path>,
+    pub offline: bool,
     pub overwrite: bool,
 }
 
@@ -95,9 +99,9 @@ pub fn render(options: &RenderImage<'_>) -> Result<Value> {
     if format == "png" && options.quality.is_some() {
         bail!("--quality applies only to JPEG and WebP");
     }
-    native(options, &source, &bytes, format)?;
+    let google_fonts = native(options, &source, &bytes, format)?;
     Ok(
-        json!({"path":options.output.canonicalize()?,"width":options.width,"height":options.height,"format":format,"renderer":"takumi","renderer_version":"2.19.0","template":source}),
+        json!({"path":options.output.canonicalize()?,"width":options.width,"height":options.height,"format":format,"renderer":"takumi","renderer_version":"2.19.0","template":source,"google_fonts":google_fonts}),
     )
 }
 
@@ -137,7 +141,7 @@ struct LocalResources {
     images: usize,
 }
 
-fn native(options: &RenderImage<'_>, source: &Path, bytes: &[u8], format: &str) -> Result<()> {
+fn native(options: &RenderImage<'_>, source: &Path, bytes: &[u8], format: &str) -> Result<Value> {
     let mut node: Node = match source.extension().and_then(|e| e.to_str()) {
         Some("json") => {
             let value: Value = serde_json::from_slice(bytes).context("invalid image node JSON")?;
@@ -198,6 +202,20 @@ fn native(options: &RenderImage<'_>, source: &Path, bytes: &[u8], format: &str) 
             .with_context(|| format!("registering font {}", path.display()))?;
         resources.inputs.push(path);
     }
+    let google = crate::fonts::load(
+        options.google_fonts,
+        options.cache_dir,
+        options.offline,
+        (32usize * 1024 * 1024).saturating_sub(resources.bytes),
+        16 - options.fonts.len(),
+    )?;
+    for font in google.files {
+        resources.bytes += font.bytes.len();
+        fonts
+            .register(FontResource::new(font.bytes))
+            .with_context(|| format!("registering explicit Google font {}", font.source_url))?;
+        resources.inputs.push(font.path.canonicalize()?);
+    }
     protect_output(options.output, &resources.inputs, options.overwrite)?;
     let bitmap = takumi::render(
         RenderOptions::builder()
@@ -218,7 +236,8 @@ fn native(options: &RenderImage<'_>, source: &Path, bytes: &[u8], format: &str) 
     if encoded.len() > 64 * 1024 * 1024 {
         bail!("encoded image exceeds 64 MiB");
     }
-    crate::io::atomic_write(options.output, &encoded, options.overwrite)
+    crate::io::atomic_write(options.output, &encoded, options.overwrite)?;
+    Ok(Value::Array(google.families))
 }
 
 fn resolve_nodes(

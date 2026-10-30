@@ -264,3 +264,93 @@ fn retired_external_backend_is_rejected_before_any_input_write() {
     failure(out, "unexpected argument '--backend'");
     assert_eq!(std::fs::read(&input).unwrap(), original);
 }
+
+#[test]
+fn explicit_google_font_cache_renders_offline_without_path_and_checks_integrity() {
+    use sha2::{Digest, Sha256};
+    let d = tempfile::tempdir().unwrap();
+    let cache = d.path().join("cache");
+    let font_root = cache.join("fonts/google");
+    let font = include_bytes!("../assets/fonts/Geist.woff2");
+    let digest = |data: &[u8]| {
+        Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let sha = digest(font);
+    let font_path = font_root.join("files").join(format!("{sha}.font"));
+    std::fs::create_dir_all(font_path.parent().unwrap()).unwrap();
+    std::fs::write(&font_path, font).unwrap();
+    let mut url = url::Url::parse("https://fonts.googleapis.com/css2").unwrap();
+    url.query_pairs_mut()
+        .append_pair("family", "Geist")
+        .append_pair("display", "swap");
+    let manifest = font_root
+        .join("families")
+        .join(format!("{}.json", digest(url.as_str().as_bytes())));
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(&manifest, serde_json::to_vec(&json!({"version":1,"selector":"Geist","css_url":url.as_str(),"fonts":[{"sha256":sha,"bytes":font.len(),"source_url":"https://fonts.gstatic.com/s/geist/v1/font.woff2"}]})).unwrap()).unwrap();
+    let template = d.path().join("title.html");
+    std::fs::write(&template, "<div style='display:flex;width:320px;height:160px;align-items:center;justify-content:center;font-family:Geist;font-size:36px;color:red'>Offline Google</div>").unwrap();
+    let out = d.path().join("title.png");
+    let args = [
+        "--google-font",
+        "Geist",
+        "--offline",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ];
+    let result = success(render(&template, &out, &args));
+    assert_eq!(result["google_fonts"][0]["selector"], "Geist");
+    assert_eq!(result["google_fonts"][0]["cached"], true);
+    assert!(
+        pixels(&out)
+            .chunks_exact(4)
+            .filter(|p| p[0] > 100 && p[3] > 100)
+            .count()
+            > 300
+    );
+    let original = std::fs::read(&out).unwrap();
+    let mut overwrite = args.to_vec();
+    overwrite.extend(["--overwrite", "--format", "png"]);
+    failure(
+        render(&template, &font_path, &overwrite),
+        "overwrite an input",
+    );
+    assert_eq!(std::fs::read(&font_path).unwrap(), font);
+    failure(
+        render(
+            &template,
+            &d.path().join("missing.png"),
+            &[
+                "--google-font",
+                "Not Cached",
+                "--offline",
+                "--cache-dir",
+                cache.to_str().unwrap(),
+            ],
+        ),
+        "not cached",
+    );
+    failure(
+        render(
+            &template,
+            &d.path().join("invalid.png"),
+            &[
+                "--google-font",
+                "Inter&text=private",
+                "--offline",
+                "--cache-dir",
+                cache.to_str().unwrap(),
+            ],
+        ),
+        "family must use",
+    );
+    std::fs::write(&font_path, b"changed cached font").unwrap();
+    failure(
+        render(&template, &out, &overwrite),
+        "integrity check failed",
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), original);
+}

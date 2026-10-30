@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Analysis {
@@ -16,6 +16,10 @@ pub struct Analysis {
     pub model: Option<String>,
     pub usage: Option<Value>,
     pub cached: bool,
+    #[serde(default)]
+    pub source_sha256: String,
+    #[serde(default)]
+    pub frames_cached: bool,
 }
 pub struct AnalyzeOptions<'a> {
     pub frames: usize,
@@ -40,11 +44,19 @@ pub fn analyze(
     if options.prompt.is_some_and(|p| p.len() > 16 * 1024) {
         bail!("editorial prompt exceeds 16 KiB");
     }
-    let transcript = options
+    let source_sha256 = crate::media::file_sha256(&info.path)?;
+    let mut transcript = options
         .transcript
         .map(crate::transcript::Transcript::load)
         .transpose()?;
-    if let Some(transcript) = &transcript {
+    if let Some(transcript) = &transcript
+        && transcript
+            .usage
+            .as_ref()
+            .and_then(|u| u.get("source_sha256"))
+            .and_then(Value::as_str)
+            .is_none()
+    {
         let source_path = if transcript.source.is_absolute() {
             transcript.source.clone()
         } else {
@@ -67,26 +79,26 @@ pub fn analyze(
         .and_then(|t| t.usage.as_ref())
         .and_then(|u| u.get("source_sha256"))
         .and_then(Value::as_str)
-        && crate::media::file_sha256(&info.path)? != expected
+        && source_sha256 != expected
     {
         bail!(
             "transcript source content has changed; transcribe the current media before analyzing"
         );
     }
-    // Each run owns a new frame subdirectory. Repeated analysis never replaces
-    // frames referenced by another report or unrelated files in the parent.
-    std::fs::create_dir_all(options.frames_dir)?;
-    let parent = options.frames_dir.canonicalize()?;
-    let run_dir = tempfile::Builder::new()
-        .prefix("sample-")
-        .tempdir_in(parent)?;
-    let frames = crate::media::sample_frames(
+    if let Some(transcript) = &mut transcript {
+        // Reports describe the currently selected file; the original transcript
+        // remains untouched and hash verification permits identical copies.
+        transcript.source = info.path.clone();
+    }
+    let (frames, frames_cached) = crate::cache::sampled_frames(
         &info,
-        run_dir.path(),
+        options.frames_dir,
+        &source_sha256,
         options.frames,
         options.start,
         duration,
     )?;
+    let run_dir = tempfile::tempdir()?;
     let audio_duration =
         if api.is_some() && info.has_audio() && !info.has_video() && transcript.is_none() {
             duration.min(60.0)
@@ -114,6 +126,8 @@ pub fn analyze(
         model: options.model.map(str::to_owned),
         usage: None,
         cached: false,
+        source_sha256,
+        frames_cached,
     };
     if let Some(api) = api {
         let model = options.model.context("remote analysis requires --model or OPENROUTER_VISION_MODEL; use --local for frame sampling without API requests")?;
@@ -143,7 +157,6 @@ pub fn analyze(
         analysis.usage = response.body.get("usage").cloned();
         analysis.cached = response.cached;
     }
-    let _persisted_dir: PathBuf = run_dir.keep();
     Ok(analysis)
 }
 fn analysis_prompt(analysis: &Analysis, brief: Option<&str>) -> String {
@@ -164,7 +177,14 @@ fn analysis_prompt(analysis: &Analysis, brief: Option<&str>) -> String {
         .ok()
         .flatten()
         .unwrap_or_else(|| "not provided".to_owned());
-    format!("You are helping a human or coding agent make a factual, well-paced edit. Analyze only the supplied source frames, audio sample, and timestamped transcript. Frames are sparse: do not invent motion, dialogue, exact shot boundaries, or unseen events. Source metadata: {}. Analyzed range: {}. Coverage: {}. Transcript words: {}. Editorial brief: {}. Return a JSON object with summary (string), observations ([{{time:number,description:string,confidence:string}}]), dialogue_summary (string or null), selects ([{{source_in:number,source_out:number,reason:string,needs_review:boolean}}]), edit_suggestions ([string]), and limitations ([string]). Select ranges must stay within the analyzed time range and are candidate ranges requiring review, not measured shot boundaries. For audio-only observations add the supplied audio sample start to sample-local times. Express all times in source seconds.", serde_json::to_string(&analysis.media).unwrap_or_default(), analysis.range, analysis.coverage, transcript, brief.unwrap_or("Identify useful material and suggest an assembly with an opening, coherent progression, and ending."))
+    format!("You are helping a human or coding agent make a factual, well-paced edit. Analyze only the supplied source frames, audio sample, and timestamped transcript. Frames are sparse: do not invent motion, dialogue, exact shot boundaries, or unseen events. Source metadata: {}. Analyzed range: {}. Coverage: {}. Transcript words: {}. Editorial brief: {}. Return a JSON object with summary (string), observations ([{{time:number,description:string,confidence:string}}]), dialogue_summary (string or null), selects ([{{source_in:number,source_out:number,reason:string,needs_review:boolean}}]), edit_suggestions ([string]), and limitations ([string]). Select ranges must stay within the analyzed time range and are candidate ranges requiring review, not measured shot boundaries. For audio-only observations add the supplied audio sample start to sample-local times. Express all times in source seconds.", {
+        let mut metadata = serde_json::to_value(&analysis.media).unwrap_or_default();
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("path");
+            object.insert("source_sha256".into(), json!(analysis.source_sha256));
+        }
+        metadata.to_string()
+    }, analysis.range, analysis.coverage, transcript, brief.unwrap_or("Identify useful material and suggest an assembly with an opening, coherent progression, and ending."))
 }
 
 fn validate_understanding(value: &Value, start: f64, duration: f64) -> Result<()> {
@@ -222,5 +242,167 @@ mod tests {
         invalid["observations"][0]["time"] = json!(0);
         assert!(validate_understanding(&invalid, 10.0, 5.0).is_err());
         assert!(validate_understanding(&json!({}), 0.0, 10.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    #[test]
+    fn identical_media_copies_reuse_frames_and_paid_response_without_stale_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.mp4");
+        let copy = dir.path().join("copy.mp4");
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=64x64:d=2:r=10",
+                "-c:v",
+                "libx264",
+            ])
+            .arg(&original)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::copy(&original, &copy).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = crate::openrouter::OpenRouter::for_test(
+            format!("http://{}", listener.local_addr().unwrap()),
+            Some(dir.path().join("responses")),
+            std::time::Duration::from_secs(3),
+        );
+        let original_text = original.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+                assert!(headers.len() < 8192);
+            }
+            let length = String::from_utf8(headers)
+                .unwrap()
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(length < 64 * 1024);
+            let mut request = vec![0; length];
+            stream.read_exact(&mut request).unwrap();
+            let request = String::from_utf8(request).unwrap();
+            assert!(!request.contains(&original_text));
+            assert!(request.contains("source_sha256"));
+            let body=serde_json::to_vec(&json!({"choices":[{"message":{"content":serde_json::to_string(&json!({"summary":"red","observations":[],"selects":[],"edit_suggestions":[],"limitations":[]})).unwrap()}}],"usage":{"cost":0}})).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let frames = dir.path().join("assets");
+        let options = AnalyzeOptions {
+            frames: 2,
+            frames_dir: &frames,
+            start: 0.0,
+            duration: Some(2.0),
+            model: Some("test/model"),
+            transcript: None,
+            prompt: None,
+        };
+        let first = analyze(
+            crate::media::probe(&original).unwrap(),
+            Some(&api),
+            &options,
+        )
+        .unwrap();
+        server.join().unwrap();
+        let second = analyze(crate::media::probe(&copy).unwrap(), Some(&api), &options).unwrap();
+        assert!(!first.cached);
+        assert!(!first.frames_cached);
+        assert!(second.cached);
+        assert!(second.frames_cached);
+        assert_eq!(first.source_sha256, second.source_sha256);
+        assert_eq!(first.frames[0].path, second.frames[0].path);
+        assert_eq!(second.media.path, copy.canonicalize().unwrap());
+        assert_ne!(first.media.path, second.media.path);
+        let different = analyze(
+            crate::media::probe(&copy).unwrap(),
+            None,
+            &AnalyzeOptions {
+                start: 0.5,
+                duration: Some(1.0),
+                ..options
+            },
+        )
+        .unwrap();
+        assert_ne!(first.frames[0].path, different.frames[0].path);
+        let transcript_file = dir.path().join("transcript.json");
+        let mut transcript = json!({"version":1,"source":"/missing/original-machine.mp4","duration":2,"text":"","words":[],"usage":{"source_sha256":second.source_sha256}});
+        crate::io::write_json(&transcript_file, &transcript, false).unwrap();
+        let transcript_options = AnalyzeOptions {
+            transcript: Some(&transcript_file),
+            ..options
+        };
+        let remapped = analyze(
+            crate::media::probe(&copy).unwrap(),
+            None,
+            &transcript_options,
+        )
+        .unwrap();
+        assert_eq!(
+            remapped.transcript.unwrap().source,
+            copy.canonicalize().unwrap()
+        );
+        transcript["usage"]["source_sha256"] = json!("0".repeat(64));
+        crate::io::write_json(&transcript_file, &transcript, true).unwrap();
+        assert!(
+            analyze(
+                crate::media::probe(&copy).unwrap(),
+                None,
+                &transcript_options
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("content has changed")
+        );
+        transcript["usage"] = Value::Null;
+        transcript["source"] = json!(original);
+        crate::io::write_json(&transcript_file, &transcript, true).unwrap();
+        assert!(
+            analyze(
+                crate::media::probe(&copy).unwrap(),
+                None,
+                &transcript_options
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("another media file")
+        );
+        std::fs::write(&second.frames[0].path, b"bad-cache-data").unwrap();
+        assert!(
+            analyze(crate::media::probe(&copy).unwrap(), None, &options)
+                .unwrap_err()
+                .to_string()
+                .contains("integrity")
+        );
     }
 }

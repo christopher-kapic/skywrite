@@ -24,9 +24,9 @@ skywrite inspect camera-a.mp4 camera-b.mp4 recorder.wav
 skywrite analyze camera-a.mp4 --local --frames 12 -o camera-a.local.json
 ```
 
-Local analysis creates a manifest and persistent JPEG frames under `.skywrite/frames/`. An agent with image tools can inspect the listed frame paths directly. Frame times are source playback seconds. Uniform samples are sparse evidence: they do not establish exact shot boundaries or reveal every event in a long recording.
+Local analysis creates a manifest and persistent JPEG frames under the shared content-addressed `~/.cache/skywrite/assets/` cache (or XDG/app override). An agent with image tools can inspect the listed frame paths directly. Frame times are source playback seconds. Uniform samples are sparse evidence: they do not establish exact shot boundaries or reveal every event in a long recording.
 
-For optional OpenRouter calls, set `OPENROUTER_API_KEY` in the environment. Select a currently available vision model with `--model MODEL_ID` or `OPENROUTER_VISION_MODEL`; Skywrite does not guess an evolving vision model ID.
+For optional OpenRouter calls, set `OPENROUTER_API_KEY` in the environment. Discover current capabilities with `skywrite models list --task analysis`, then select `--model MODEL_ID`, `SKYWRITE_ANALYSIS_MODEL`, or a saved default (`skywrite models set-default analysis MODEL_ID`). Legacy `OPENROUTER_VISION_MODEL` is supported. Skywrite does not guess an evolving model ID.
 
 ```sh
 skywrite transcribe recorder.wav --language en -o recorder.transcript.json
@@ -38,7 +38,7 @@ Transcription uses OpenRouter's `/audio/transcriptions`, requests `verbose_json`
 
 `--start SECONDS --duration SECONDS` limits the selected range for transcription and analysis. Transcription word positions remain relative to the full source, including that starting offset. A transcript supplied to `analyze --transcript` must reference the same source file. Audio-only remote analysis without a transcript sends at most the first 60 seconds of the chosen range and labels that coverage. Video analysis sends sampled frames; include a transcript to supply dialogue.
 
-Explicit remote commands may incur OpenRouter charges. Requests have time, size, frame, and output-token limits, with no automatic paid retries. Exact API request content, model, endpoint, and API base are hashed into the `.skywrite/cache/` response cache; repeated identical requests reuse it. `--cache-dir PATH` relocates it and `--no-cache` disables it. The cache contains media-derived text; delete it when no longer needed. Cached requests can be used without a key. The CLI does not enforce an account-wide dollar budget; use a capped API key.
+Explicit remote commands may incur OpenRouter charges. Requests have time, size, frame, and output-token limits, with no automatic paid retries. Exact API request content, model, endpoint, and API base are hashed into the shared `~/.cache/skywrite/responses/` response cache; repeated identical requests reuse it. `--cache-dir PATH` relocates it and `--no-cache` disables response cache reads/writes. Derived frame files are cached separately by source content and sampling settings, so copied files share artifacts. Contextual frame-batch descriptions are cached together; descriptions are not independent per-frame entries. The cache contains media-derived text; delete it when no longer needed. Cached requests can be used without a key. The CLI does not enforce an account-wide dollar budget; use a capped API key.
 
 ## Synchronize recordings
 
@@ -147,3 +147,11 @@ cargo test --locked
 Integration tests require installed FFmpeg/ffprobe and exercise actual decoding, rendering, and known timing transformations. Paid network tests are explicit/manual: `transcribe` and `analyze` with a capped OpenRouter key and a small licensed fixture. Do not confuse local/cached protocol tests with a successful provider call.
 
 The public AMI corpus (CC BY 4.0) is suitable for multi-microphone synchronization tests; controlled copies with known trims/rates provide ground truth. `https://groups.inf.ed.ac.uk/ami/download/` lists downloads and attribution. Synthetic fixtures are generated locally for deterministic regression checks. Review run evidence and unavailable checks are recorded separately from the application.
+
+## Agent workspace and reusable workflows
+
+Record **ALL** agent frustrations, bugs and missing features with `skywrite nit 'description'`. This temporary feedback command saves local JSON files in `~/.skywrite/nits/`; nothing is uploaded. Your editor can share that folder. Save creative prompts with `skywrite styles create NAME --content 'prompt'` and read/update them later. `skywrite skills list` discovers built-in Hyperframes, Remotion, FCPXML, FFmpeg, Takumi, sync and workflow instructions; personal Markdown skills can shadow them explicitly. `SKYWRITE_HOME` relocates personal files. See [workspace details](docs/workspace.md).
+
+Tools can be composed: render a native HTML graphic, add its PNG to a Resolve/FCPXML edit, and use a Remotion/Hyperframes project for animation. Generation workflows can build a character image, derive reference frames and supply them to a compatible video model; always check actual reference capabilities before requesting a paid job.
+
+Google Fonts are explicit: `skywrite image render --file title.html -o title.png --google-font 'Inter:wght@400;700'`. Downloads are cached and `--offline` uses cached variants. Takumi supports upstream `tw` utilities and inline styles, not a full browser or arbitrary Tailwind stylesheet compiler. See [fonts](docs/fonts.md), and [shared cache, model discovery and task defaults](docs/cache-models.md).

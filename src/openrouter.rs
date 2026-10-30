@@ -70,6 +70,44 @@ impl OpenRouter {
             base_url,
         }
     }
+    /// Public catalog GETs never attach a key; response pagination URLs are data.
+    pub fn catalog(&self, endpoint: &str) -> Result<Value> {
+        if !matches!(
+            endpoint,
+            "models"
+                | "models?output_modalities=image"
+                | "models?output_modalities=video"
+                | "models?output_modalities=transcription"
+                | "images/models"
+                | "videos/models"
+        ) {
+            bail!("unsupported OpenRouter catalog endpoint");
+        }
+        let response = self
+            .client
+            .get(format!("{}/{endpoint}", self.base_url))
+            .send()
+            .context("OpenRouter public catalog request failed")?;
+        let status = response.status();
+        let bytes = bounded_response(response)?;
+        if !status.is_success() {
+            bail!(
+                "OpenRouter catalog HTTP {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(2048)
+                    .collect::<String>()
+            );
+        }
+        let body: Value =
+            serde_json::from_slice(&bytes).context("invalid OpenRouter catalog JSON")?;
+        if !body["data"].is_array() {
+            bail!("OpenRouter catalog has no data array");
+        }
+        Ok(body)
+    }
+
     pub fn request(&self, endpoint: &str, body: &Value) -> Result<ApiResponse> {
         if !matches!(endpoint, "audio/transcriptions" | "chat/completions") {
             bail!("unsupported OpenRouter endpoint");
@@ -366,5 +404,44 @@ mod tests {
             assert!(format!("{error:#}").contains("timed out"), "{error:#}");
             server.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn public_catalog_get_omits_auth_and_rejects_unlisted_routes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = OpenRouter::for_test(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            Duration::from_secs(2),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let text = String::from_utf8(request).unwrap().to_lowercase();
+            assert!(text.starts_with("get /videos/models http/1.1"));
+            assert!(!text.contains("authorization:"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").unwrap();
+        });
+        assert_eq!(
+            api.catalog("videos/models").unwrap()["data"],
+            serde_json::json!([])
+        );
+        server.join().unwrap();
+        assert!(api.catalog("https://example.invalid").is_err());
+        assert!(api.catalog("../credits").is_err());
     }
 }

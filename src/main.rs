@@ -10,7 +10,7 @@ use std::time::Duration;
     name = "skywrite",
     version,
     about = "Agent-friendly media understanding, synchronization, and editing",
-    after_help = "All successful commands emit JSON to stdout. Diagnostics go to stderr. Run skywrite schema for edit/transcript examples."
+    after_help = "All successful commands emit JSON to stdout. Diagnostics go to stderr. Agents: save ALL frustrations, bugs, and missing features with skywrite nit <description>. Run skywrite schema for edit/transcript examples. Compose tools: render HTML graphics as image clips in FCPXML/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,6 +39,23 @@ enum Command {
         #[command(subcommand)]
         command: EditCommand,
     },
+    /// Discover models and save explicit task defaults (no API key stored).
+    Models {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// Save/read reusable creative prompts in ~/.skywrite/styles.
+    Styles {
+        #[command(subcommand)]
+        command: skywrite::workspace::ContentCommand,
+    },
+    /// Read built-in workflows and save personal procedural instructions.
+    Skills {
+        #[command(subcommand)]
+        command: skywrite::workspace::ContentCommand,
+    },
+    /// Save ALL agent frustrations in ~/.skywrite/nits (never uploads).
+    Nit { description: String },
     /// Print agent-facing edit and transcript schemas/examples.
     Schema,
     /// Render still assets such as title cards using embedded upstream Takumi.
@@ -58,9 +75,9 @@ struct OutputOptions {
 }
 #[derive(Args)]
 struct ApiOptions {
-    /// Exact request/response cache. Contains media-derived model responses.
-    #[arg(long, default_value = ".skywrite/cache")]
-    cache_dir: PathBuf,
+    /// Shared cache root (default XDG cache or ~/.cache/skywrite).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Disable reading and writing response cache.
     #[arg(long)]
     no_cache: bool,
@@ -70,8 +87,9 @@ struct AnalyzeArgs {
     input: PathBuf,
     #[arg(long, default_value_t = 8)]
     frames: usize,
-    #[arg(long, default_value = ".skywrite/frames")]
-    frames_dir: PathBuf,
+    /// Override the content-addressed frame cache root.
+    #[arg(long)]
+    frames_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0.0)]
     start: f64,
     #[arg(long)]
@@ -96,8 +114,8 @@ struct AnalyzeArgs {
 #[derive(Args)]
 struct TranscribeArgs {
     input: PathBuf,
-    #[arg(long, default_value = "openai/whisper-large-v3")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
     #[arg(long)]
     language: Option<String>,
     #[arg(long, default_value_t = 0.0)]
@@ -193,8 +211,49 @@ enum ImageCommand {
         quality: Option<u8>,
         #[arg(long)]
         font: Vec<String>,
+        /// Explicit Google Fonts family/variant (repeatable); downloads are cached.
+        #[arg(long)]
+        google_font: Vec<String>,
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Use already cached Google Fonts without network requests.
+        #[arg(long)]
+        offline: bool,
         #[arg(long)]
         overwrite: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// List capabilities and prices from free cached OpenRouter catalogs.
+    List {
+        #[arg(long,value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        task: Option<String>,
+        #[arg(long)]
+        input: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long, conflicts_with = "offline")]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Read saved defaults and task environment variable names.
+    Defaults,
+    /// Save an explicit model ID; does not call or pay for the model.
+    SetDefault {
+        #[arg(value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        task: String,
+        model: String,
+    },
+    UnsetDefault {
+        #[arg(value_parser=clap::builder::PossibleValuesParser::new(skywrite::models::TASKS.iter().copied()))]
+        task: String,
     },
 }
 
@@ -245,11 +304,8 @@ fn main() {
     }
 }
 fn api(options: &ApiOptions) -> Result<skywrite::openrouter::OpenRouter> {
-    skywrite::openrouter::OpenRouter::new(if options.no_cache {
-        None
-    } else {
-        Some(&options.cache_dir)
-    })
+    let cache = skywrite::cache::cache_root(options.cache_dir.as_deref())?.join("responses");
+    skywrite::openrouter::OpenRouter::new(if options.no_cache { None } else { Some(&cache) })
 }
 fn finish(value: Value, output: &OutputOptions) -> Result<Value> {
     if let Some(path) = &output.output {
@@ -291,11 +347,12 @@ fn execute(command: Command) -> Result<Value> {
             preflight_output(&args.output)?;
             protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
             let info = skywrite::media::probe(&args.input)?;
+            let model = skywrite::models::resolve_model("transcription", args.model.as_deref())?;
             let result = skywrite::transcript::transcribe(
                 &info,
                 &api(&args.api)?,
                 &skywrite::transcript::TranscribeOptions {
-                    model: &args.model,
+                    model: &model,
                     language: args.language.as_deref(),
                     start: args.start,
                     duration: args.duration,
@@ -308,14 +365,18 @@ fn execute(command: Command) -> Result<Value> {
             preflight_output(&args.output)?;
             protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
             let info = skywrite::media::probe(&args.input)?;
-            let model = args
-                .model
-                .or_else(|| std::env::var("OPENROUTER_VISION_MODEL").ok());
-            if !args.local && model.is_none() {
-                bail!(
-                    "remote analysis requires --model or OPENROUTER_VISION_MODEL; use --local to sample frames without OpenRouter"
-                );
-            }
+            let model = if args.local {
+                None
+            } else {
+                Some(skywrite::models::resolve_model(
+                    "analysis",
+                    args.model.as_deref(),
+                )?)
+            };
+            let frames_dir = match args.frames_dir {
+                Some(path) => path,
+                None => skywrite::cache::cache_root(args.api.cache_dir.as_deref())?.join("assets"),
+            };
             let client = if args.local {
                 None
             } else {
@@ -326,7 +387,7 @@ fn execute(command: Command) -> Result<Value> {
                 client.as_ref(),
                 &skywrite::analysis::AnalyzeOptions {
                     frames: args.frames,
-                    frames_dir: &args.frames_dir,
+                    frames_dir: &frames_dir,
                     start: args.start,
                     duration: args.duration,
                     model: if args.local { None } else { model.as_deref() },
@@ -397,6 +458,39 @@ fn execute(command: Command) -> Result<Value> {
                 output,
             } => suggest(&analysis, &brief, model.as_deref(), &options, &output),
         },
+        Command::Models { command } => match command {
+            ModelCommand::List {
+                task,
+                input,
+                output,
+                search,
+                refresh,
+                offline,
+                cache_dir,
+            } => skywrite::models::list(&skywrite::models::ListOptions {
+                task: task.as_deref(),
+                input: input.as_deref(),
+                output: output.as_deref(),
+                search: search.as_deref(),
+                refresh,
+                offline,
+                cache_dir: cache_dir.as_deref(),
+            }),
+            ModelCommand::Defaults => Ok(
+                json!({"defaults":skywrite::workspace::model_defaults()?,"task_environment":skywrite::models::TASKS.iter().map(|task|Ok((task.to_string(),skywrite::models::task_environment(task)?))).collect::<Result<std::collections::BTreeMap<_,_>>>()?,"precedence":["--model","task environment (or legacy OPENROUTER_VISION_MODEL for analysis/editing)","saved task default","transcription fallback only: openai/whisper-large-v3"]}),
+            ),
+            ModelCommand::SetDefault { task, model } => {
+                skywrite::workspace::set_default_model(&task, &model)
+            }
+            ModelCommand::UnsetDefault { task } => skywrite::workspace::unset_default_model(&task),
+        },
+        Command::Styles { command } => {
+            skywrite::workspace::execute_content(skywrite::workspace::ContentKind::Styles, command)
+        }
+        Command::Skills { command } => {
+            skywrite::workspace::execute_content(skywrite::workspace::ContentKind::Skills, command)
+        }
+        Command::Nit { description } => skywrite::workspace::record_nit(&description),
         Command::Schema => Ok(schema()),
         Command::Image { command } => match command {
             ImageCommand::Render {
@@ -407,6 +501,9 @@ fn execute(command: Command) -> Result<Value> {
                 format,
                 quality,
                 font,
+                google_font,
+                cache_dir,
+                offline,
                 overwrite,
             } => skywrite::image::render(&skywrite::image::RenderImage {
                 file: &file,
@@ -416,6 +513,9 @@ fn execute(command: Command) -> Result<Value> {
                 format: format.as_deref(),
                 quality,
                 fonts: &font,
+                google_fonts: &google_font,
+                cache_dir: cache_dir.as_deref(),
+                offline,
                 overwrite,
             }),
         },
@@ -439,10 +539,7 @@ fn suggest(
     if analyses.len() > 32 || brief.len() > 16 * 1024 {
         bail!("suggest supports at most 32 analyses and a 16-KiB brief");
     }
-    let model = model
-        .map(str::to_owned)
-        .or_else(|| std::env::var("OPENROUTER_VISION_MODEL").ok())
-        .context("edit suggest requires --model or OPENROUTER_VISION_MODEL")?;
+    let model = skywrite::models::resolve_model("editing", model)?;
     let mut reports = Vec::new();
     let mut allowed = std::collections::HashSet::new();
     for file in analyses {
