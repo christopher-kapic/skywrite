@@ -50,6 +50,10 @@ skywrite jobs status JOB_ID --refresh
 
 A completed same-format replay needs neither an API key nor network/FFmpeg. Conversion needs FFmpeg. `--refresh` may query OpenRouter; speech billing can settle after the audio response, so an early job can have `usage: null`. Refresh can retrieve the later reported cost from generation metadata. Check activity for an uncertain submission before intentionally using a new `--take`; doing so is a new paid variation, not an automatic retry.
 
+## Measured live checks
+
+On 2026-10-30, Kokoro narration and Lyria 3 Clip music produced decoded audio through the CLI, including MP3-to-WAV publication and completed-job replay without keys or network. Lyria Pro was discovered in the catalog but was not live-generated in this pass. See [validation](validation.md) for measured formats, costs and the separate H3 video check. These results do not guarantee other models’ availability or artistic output.
+
 ## Technical explainers
 
 Read `skywrite skills read technical-explainer`. Check a script's facts first; generate narration, then use `transcribe` for actual word timings. Render precise labels/diagrams with Takumi and animate them with Hyperframes or Remotion. Place narration and a quieter music bed in the edit's audio tracks and export/render normally. Generated footage can supplement deterministic technical graphics. See [edit format](edit-format.md), [configuration](configuration.md), and [shared outputs](outputs.md).

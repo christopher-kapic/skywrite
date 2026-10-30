@@ -1,8 +1,10 @@
 # Public S3/R2 video sources
 
-**Implemented, but not tested against a live S3 or R2 bucket.** The first cloud
-compatibility check is intentionally left to the user. Local compilation,
-configuration and dry-run checks do not establish live bucket compatibility.
+A live Cloudflare R2 pass on 2026-10-30 verified upload/reuse, public URL bytes,
+R2-backed upscaling, active-job protection, cleanup recovery, and scoped purge.
+See [validation and limits](validation.md). Amazon S3 itself, other compatible
+providers, maximum-size transfers, and forced concurrent stale-ETag races were
+not certified. Configuration and dry-run commands do not verify a bucket.
 
 OpenRouter's dedicated video upscaler requires an accessible HTTPS video URL.
 Skywrite can upload a local MP4 to your explicitly configured public bucket,

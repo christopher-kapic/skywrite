@@ -5,7 +5,11 @@ those names from another machine. Both machines configure the same S3/R2 bucket,
 outputs prefix and API endpoint. Credentials stay in `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`; machine A can use
 read-only credentials with list/get access. Nothing is uploaded automatically.
-Live S3/R2 compatibility has **not** been tested; the user is validating it.
+A live Cloudflare R2 pass on 2026-10-30 verified publication, discovery and
+download across two isolated machine configurations, including Unicode names,
+empty files, range downloads and explicit replacement. See
+[validation and limits](validation.md); Amazon S3 itself and forced simultaneous
+stale-ETag writers were not tested.
 
 ```sh
 # Machine B: finish a render, then publish it.
@@ -54,8 +58,9 @@ byte length, content type, immutable blob key and creation time. Skywrite upload
 or reuses the complete hash-addressed blob before publishing the named record.
 A named record therefore does not advertise an incomplete upload. Two machines
 can safely upload the same bytes, while simultaneous changes to the same name
-are resolved by the store's conditional create/update operation. Live provider
-support for these conditions remains unverified until bucket testing.
+are resolved by the store's conditional create/update operation. R2 accepted the
+normal conditional create/update paths in the live pass; that check did not force
+simultaneous stale-ETag writers or certify other providers.
 
 A filename extension is convenient for media metadata, but SHA-256 identifies
 the bytes. The remote extension is a bounded lowercase source extension or

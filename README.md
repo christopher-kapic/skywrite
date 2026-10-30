@@ -13,9 +13,22 @@ cargo build --release --locked
 ./target/release/skywrite doctor
 ```
 
-The core is Rust. Direct dependencies are established projects: clap, serde/serde_json, anyhow, reqwest with Rustls, base64, RustCrypto sha2, tempfile, url, and libc. `Cargo.lock` records the exact resolved dependency tree. No Python or Node runtime is needed for inspection, synchronization, FCPXML export, or the native FFmpeg renderer.
+The core is Rust. Direct dependencies include established projects: clap, serde/serde_json, anyhow, reqwest with Rustls, RustCrypto sha2, tempfile, signal-hook, Tokio, and Apache Arrow’s `object_store` S3 backend. `Cargo.lock` records the exact resolved dependency tree. No Python or Node runtime is needed for inspection, synchronization, FCPXML export, or the native FFmpeg renderer.
 
 All successful commands emit one JSON document on stdout. Progress and errors go to stderr; errors have a JSON `error` object and nonzero exit status. `--help` is human-readable. Output files are never replaced without `--overwrite`. Consumed media, edit JSON, transcript, and analysis inputs cannot be used as output destinations, including with `--overwrite`. Paths in an edit are relative to the edit JSON file; exported FCPXML uses absolute file URLs.
+
+## First test
+
+```sh
+skywrite init
+skywrite defaults image
+skywrite models list --task image
+skywrite skills read technical-explainer
+```
+
+Initialization works offline and preserves existing preferences. Model listing is a free catalog request, not generation. Set `OPENROUTER_API_KEY` in the environment inherited by your agent before paid commands. Use `skywrite defaults image set MODEL_ID` to change a preference; the getter also shows environment overrides. See [configuration](docs/configuration.md), [narration and music](docs/audio-generation.md), and [shared outputs](docs/outputs.md).
+
+Record **ALL** frustrations with `skywrite nit 'description'` while testing.
 
 ## Understand media
 
@@ -144,9 +157,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Integration tests require installed FFmpeg/ffprobe and exercise actual decoding, rendering, and known timing transformations. Paid network tests are explicit/manual: `transcribe` and `analyze` with a capped OpenRouter key and a small licensed fixture. Do not confuse local/cached protocol tests with a successful provider call.
+Integration tests require installed FFmpeg/ffprobe and exercise actual decoding, rendering, and known timing transformations. Paid network tests are explicit/manual and use a capped OpenRouter key. Dated live checks cover transcription/understanding, image generation, H3/H3 Max video, video upscaling, narration, and Lyria Clip music; R2 checks use an explicitly configured test namespace. Do not confuse local/cached protocol tests with a successful provider call.
 
-The public AMI corpus (CC BY 4.0) is suitable for multi-microphone synchronization tests; controlled copies with known trims/rates provide ground truth. `https://groups.inf.ed.ac.uk/ami/download/` lists downloads and attribution. Synthetic fixtures are generated locally for deterministic regression checks. Review run evidence and unavailable checks are recorded separately from the application.
+The public AMI corpus (CC BY 4.0) is suitable for multi-microphone synchronization tests; controlled copies with known trims/rates provide ground truth. `https://groups.inf.ed.ac.uk/ami/download/` lists downloads and attribution. Synthetic fixtures are generated locally for deterministic regression checks. See [measured validation and limits](docs/validation.md). Final independent review is still in progress; these checks are not production or all-platform certification.
 
 ## Agent workspace and reusable workflows
 
@@ -158,9 +171,9 @@ Google Fonts are explicit: `skywrite image render --file title.html -o title.png
 
 Generation and upscaling are available through `skywrite generate image|video`, `skywrite upscale image|video`, and `skywrite jobs list|status|resume`. Reuse character references, animate a keyframe, then include generated media in the validated edit format. Durable jobs retain provenance/cost and prevent automatic duplicate paid submissions. Choose a task model explicitly or save its default; preview with `--dry-run`.
 
-AI video upscaling requires `--source-job` for generated video or `--source-url` for your hosted HTTPS source. OpenRouter currently rejects local video uploads/data URLs for this operation. `upscale image` is explicitly non-AI FFmpeg Lanczos resizing. See [generation and jobs](docs/generation.md) for commands and recovery limits.
+AI video upscaling needs an accessible HTTPS source: use `--source-job` for generated video, `--source-url` for a hosted source, or `--upload` with your configured public S3/R2 bucket. OpenRouter currently rejects inline local video data URLs for this operation. `upscale image` is explicitly non-AI FFmpeg Lanczos resizing. See [generation and jobs](docs/generation.md) for commands and recovery limits.
 
-Public S3/R2 sources for local video upscaling are implemented behind explicit `--upload`, with hash reuse, optional `--delete-upload-after`, and scoped `skywrite storage purge`. **Live bucket compatibility is untested and intentionally left to the user.** See [storage setup and cleanup](docs/storage.md).
+Public S3/R2 sources for local video upscaling are implemented behind explicit `--upload`, with hash reuse, optional `--delete-upload-after`, and scoped `skywrite storage purge`. A live Cloudflare R2 pass on 2026-10-30 verified upload reuse, R2-backed upscaling, cleanup recovery, scoped purge, and cross-machine output transfer. Amazon S3 itself and other compatible providers were not tested. See [storage setup and cleanup](docs/storage.md).
 
 ## Setup and generated narration/music
 

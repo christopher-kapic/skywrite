@@ -23,7 +23,7 @@ Image generation accepts repeatable local PNG/JPEG/WebP references. Video genera
 
 `upscale image` is local **non-AI Lanczos resizing** through FFmpeg. No dedicated image super-resolution model is currently discovered in OpenRouter's image catalog. Generating a larger image from a reference is a separate generative edit that can invent details.
 
-Dedicated AI video upscaling accepts `--source-job` for a completed generated video, or `--source-url https://...` for a file you host. OpenRouter currently rejects video data URLs and its Files API does not accept MP4 uploads. Use explicit `--upload` to publish a local MP4 through your configured public S3/R2 bucket; its live bucket compatibility is intentionally user-unverified. Optional positional local input records provenance; with `--source-job`, its bytes must match the original result. With an arbitrary hosted URL, local bytes cannot establish the remote URL's contents. Signed source URLs are obtained when needed, omitted from printed provenance, and excluded from source-job request identity.
+Dedicated AI video upscaling accepts `--source-job` for a completed generated video, or `--source-url https://...` for a file you host. OpenRouter currently rejects video data URLs and its Files API does not accept MP4 uploads. Use explicit `--upload` to publish a local MP4 through your configured public S3/R2 bucket; its R2 upload and cleanup paths were exercised in the dated [live validation](validation.md). Optional positional local input records provenance; with `--source-job`, its bytes must match the original result. With an arbitrary hosted URL, local bytes cannot establish the remote URL's contents. Signed source URLs are obtained when needed, omitted from printed provenance, and excluded from source-job request identity.
 
 `--dry-run` validates capabilities and reports the intended request without a paid submission; catalog fetches are free. `--offline` uses cached **model metadata only**; generation still contacts OpenRouter. For a source job, obtaining its current signed URL also uses the network.
 
@@ -41,4 +41,4 @@ Protocol references: [Image API](https://openrouter.ai/docs/guides/overview/mult
 
 ## Optional public S3/R2 uploads
 
-`upscale video FILE --upload [--delete-upload-after]` hosts a local MP4 in an explicitly configured public S3/R2 bucket. Hash reuse and scoped cleanup are described in [storage.md](storage.md). Live bucket compatibility is intentionally left untested for the user. Existing `--source-job` and `--source-url` routes remain available.
+`upscale video FILE --upload [--delete-upload-after]` hosts a local MP4 in an explicitly configured public S3/R2 bucket. Hash reuse and scoped cleanup are described in [storage.md](storage.md). The dated [live R2 pass](validation.md) exercised this path; Amazon S3 itself and other compatible providers were not tested. Existing `--source-job` and `--source-url` routes remain available.

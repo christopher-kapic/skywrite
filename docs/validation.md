@@ -1,5 +1,63 @@
 # Public media and live provider validation
 
+## Current first-test evidence
+
+On 2026-10-30, the combined runtime at `b63e0b8` passed **129 top-level tests**,
+formatting and all-target Clippy with warnings denied. Rust 1.91 successfully
+checked all targets on Linux, and the optimized release build completed. The
+runtime tests used current stable Rust; the minimum-version check establishes
+compilation, not a second full runtime test matrix. Final independent review is
+still in progress. These results do not claim production readiness, secondary-OS
+coverage, or actual Final Cut/Resolve import.
+
+Live observations were collected during implementation using explicit capped
+OpenRouter requests and a user-authorized R2 test namespace. They are measured
+examples, not a compatibility promise for every model or S3 provider:
+
+| Executed check | Observed result |
+| --- | --- |
+| Image generation and reference edit | FLUX 3 Image Klein returned JPEG; PNG publication converted the bytes correctly; $0.009 per request |
+| H3 Max video | 832×480, 24 fps, about 5.184 s; $0.25 |
+| Exact MiniMax H3 video | 2560×1440, 24 fps, about 5.167 s, AAC 32-kHz stereo; $0.65 |
+| Dedicated video upscale | 832×480 became 1664×960; about 24 ms duration difference, below one frame; $0.130667 per tested upscale |
+| Kokoro narration | `hexgrad/kokoro-82m`, `af_heart`: decoded 9.945 s, 24-kHz mono MP3; settled cost $0.000093 |
+| Lyria 3 Clip music | Actual CLI retained MP3 and published 24.921 s of 48-kHz stereo WAV; $0.04. A separate protocol request also cost $0.04 |
+| Narration word timing | ASR recovered the clock-drift explanation with 22 word timestamps; $0.000308333333 |
+| Completed audio/video replay | Saved results republished without keys or network, with no new paid submission |
+
+Reported OpenRouter costs across the run total approximately **$1.27**
+($1.2679505667), including rejected/protocol probes and the R2-backed upscale.
+Lyria Pro was catalog-discovered but not live-generated. Music duration, vocals
+and artistic suitability require listening review; a requested format can differ
+from the provider's actual container, so successful publication requires decoding
+and any necessary conversion. MIDI/text-score rendering remains deferred. Image
+upscaling is local Lanczos resizing; the tested AI upscaler is for video.
+
+The live Cloudflare R2 pass used Apache Arrow’s `object_store` 0.14.2 backend.
+It exercised signed hash-addressed MP4 upload and HEAD reuse, public HTTPS byte/hash identity, an actual upscale using that R2 source,
+and deletion only after a verified local result. Cleanup deferred for another
+unfinished local receipt; a configuration mismatch preserved the result and
+source, and restoring settings allowed cleanup on resume. Paged purge preserved
+active sources and foreign/unmarked controls while removing eligible inputs.
+
+Two isolated machine configurations also exercised named output publication,
+name/hash discovery, pagination, Unicode names, empty files, explicit conditional
+replacement, a 4-MiB-plus-37-byte range download, checksum/no-clobber behavior,
+and protection of the local storage configuration. Temporary inputs and surplus
+fixtures were removed; one finished example was retained outside the repository.
+These checks used a captured working debug binary containing storage/outputs;
+a final-release read/list/download check is separate evidence. No credentials,
+account endpoints or public test-bucket URLs are stored in the repository.
+
+Not established: Amazon S3 itself or other compatible services; maximum 512-MiB
+transfers and slow-network throughput; forced simultaneous stale-ETag writers;
+every crash/power-loss window; cross-computer input-job leases; versioned-bucket
+reclamation or CDN invalidation. Input cleanup protects local job receipts only;
+use separate project prefixes when independent computers may still need a source.
+Shared outputs are outside the temporary-input purge namespace.
+
+## Reproduce public-media checks
+
 The normal Rust test suite works offline and uses generated media. Public media
 and paid calls are opt-in. Run from the repository root:
 
@@ -100,5 +158,6 @@ signal notification thread per process; calls do not accumulate readers or file
 descriptors. Signal exit keeps the normal signal status, after active helper
 groups have been killed and direct children reaped. SIGKILL, machine failure and
 descendants that deliberately leave their assigned process group are outside
-this cleanup guarantee. Secondary operating systems and the declared Rust 1.91
-minimum require separate validation; the local pass uses Linux/current Rust.
+this cleanup guarantee. Secondary operating systems require separate validation.
+The current combined pass also checked all targets with Rust 1.91 on Linux;
+runtime regressions used Linux/current stable Rust.
