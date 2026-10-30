@@ -1,0 +1,74 @@
+use anyhow::{Context, Result, bail};
+use serde::{Serialize, de::DeserializeOwned};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::Path;
+
+pub const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("JSON input must be a regular local file");
+    }
+    let mut reader = file.take(MAX_JSON_BYTES + 1);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_JSON_BYTES {
+        bail!("JSON input exceeds 64 MiB");
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+pub fn write_json(path: &Path, value: &impl Serialize, overwrite: bool) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    atomic_write(path, &bytes, overwrite)
+}
+/// Publish a complete output atomically; replacement is always explicit.
+pub fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    if overwrite {
+        temp.persist(path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("writing {}", path.display()))?;
+    } else {
+        temp.persist_noclobber(path)
+            .map_err(|e| e.error)
+            .with_context(|| {
+                format!(
+                    "writing {}; output exists? use --overwrite to replace it",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn output_requires_explicit_overwrite() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("out.json");
+        atomic_write(&p, b"first", false).unwrap();
+        assert!(atomic_write(&p, b"second", false).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+        atomic_write(&p, b"second", true).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+    }
+}
