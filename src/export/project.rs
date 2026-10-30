@@ -176,10 +176,12 @@ fn remotion(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>
     }
     let data = json!({"width":edit.width,"height":edit.height,"fps":fps,"duration":edit.duration_frames,"shots":shots,"audio":audio});
     fs::write(dir.join("edit.json"), serde_json::to_vec_pretty(&data)?)?;
+    // Keep Remotion packages in lockstep on a published release. Its transitive
+    // Zod pin needs the same-major security fix for GHSA-mrhx-c7xc-m3w5.
     fs::write(
         dir.join("package.json"),
         serde_json::to_vec_pretty(
-            &json!({"name":"skywrite-edit","private":true,"version":"1.0.0","scripts":{"studio":"remotion studio index.jsx","render":"remotion render index.jsx Skywrite edit.mp4"},"dependencies":{"@remotion/cli":"4.0.540","remotion":"4.0.540","react":"19.1.0","react-dom":"19.1.0"}}),
+            &json!({"name":"skywrite-edit","private":true,"version":"1.0.0","scripts":{"studio":"remotion studio index.jsx","render":"remotion render index.jsx Skywrite edit.mp4"},"dependencies":{"@remotion/cli":"4.0.539","remotion":"4.0.539","react":"19.3.1","react-dom":"19.3.1"},"overrides":{"zod":"4.6.7"}}),
         )?,
     )?;
     fs::write(

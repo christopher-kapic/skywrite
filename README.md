@@ -109,7 +109,7 @@ Suggestions use only analyzed sources and are validated before being written. Mo
 skywrite edit export edit.json --to fcpxml -o edit.fcpxml
 skywrite edit render edit.json -o preview.mp4
 skywrite edit export edit.json --to ffmpeg -o render.py
-python3 render.py preview.mp4
+python3 render.py --output preview.mp4
 skywrite edit export edit.json --to hyperframes -o hyperframes-project
 skywrite edit export edit.json --to remotion -o remotion-project
 ```
