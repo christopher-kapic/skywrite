@@ -10,6 +10,28 @@ use std::time::Duration;
 const API_BASE: &str = "https://openrouter.ai/api/v1";
 const MAX_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn http_client(connect_timeout: Duration, request_timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("initializing HTTPS client")
+}
+fn bounded_response(reader: impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("reading OpenRouter response")?;
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        bail!("OpenRouter response exceeded 8 MiB");
+    }
+    Ok(bytes)
+}
 
 pub struct OpenRouter {
     client: Client,
@@ -24,12 +46,7 @@ pub struct ApiResponse {
 }
 impl OpenRouter {
     pub fn new(cache_dir: Option<&Path>) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(180))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("initializing HTTPS client")?;
+        let client = http_client(CONNECT_TIMEOUT, REQUEST_TIMEOUT)?;
         let key = std::env::var("OPENROUTER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -39,6 +56,19 @@ impl OpenRouter {
             cache_dir: cache_dir.map(Path::to_owned),
             base_url: API_BASE.to_owned(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        base_url: String,
+        cache_dir: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            client: http_client(timeout, timeout).unwrap(),
+            key: Some("DUMMY_TEST_ONLY".into()),
+            cache_dir,
+            base_url,
+        }
     }
     pub fn request(&self, endpoint: &str, body: &Value) -> Result<ApiResponse> {
         if !matches!(endpoint, "audio/transcriptions" | "chat/completions") {
@@ -56,7 +86,13 @@ impl OpenRouter {
             .as_ref()
             .map(|dir| dir.join(format!("{key}.json")));
         if let Some(path) = cache.as_ref().filter(|path| path.is_file()) {
-            let cached: Value = crate::io::read_json(path)?;
+            // Cached provider data has the same byte budget as a live response.
+            let file = std::fs::File::open(path)?;
+            if !file.metadata()?.is_file() {
+                bail!("OpenRouter cache must be a regular file");
+            }
+            let cached: Value = serde_json::from_slice(&bounded_response(file)?)
+                .context("invalid OpenRouter cache JSON")?;
             return Ok(ApiResponse {
                 body: cached,
                 cached: true,
@@ -78,14 +114,7 @@ impl OpenRouter {
             .send()
             .context("OpenRouter request failed")?;
         let status = response.status();
-        let mut bytes = Vec::new();
-        response
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("reading OpenRouter response")?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            bail!("OpenRouter response exceeded 8 MiB");
-        }
+        let bytes = bounded_response(response)?;
         if !status.is_success() {
             let message: String = String::from_utf8_lossy(&bytes).chars().take(2048).collect();
             bail!("OpenRouter HTTP {}: {}", status.as_u16(), message);
@@ -96,7 +125,7 @@ impl OpenRouter {
             bail!("OpenRouter returned an error: {}", parsed["error"]);
         }
         if let Some(path) = cache {
-            match crate::io::write_json(&path, &parsed, false) {
+            match crate::io::atomic_write(&path, &serde_json::to_vec(&parsed)?, false) {
                 Ok(()) => {}
                 Err(_) if path.is_file() => {}
                 Err(e) => return Err(e).context("saving OpenRouter response cache"),
@@ -182,5 +211,160 @@ mod tests {
             .to_string()
             .contains("OPENROUTER_API_KEY")
         );
+    }
+    // A single owned loopback request, with real reqwest transport and bounded
+    // server lifetime. No runtime credentials or remote endpoints are involved.
+    fn fixture(
+        reply: Vec<u8>,
+        before_headers: Duration,
+        before_body: Duration,
+    ) -> (OpenRouter, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let header = String::from_utf8(request).unwrap();
+            assert!(
+                header
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer dummy_test_only")
+            );
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["model"],
+                "fixture"
+            );
+            std::thread::sleep(before_headers);
+            let split = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let _ = stream.write_all(&reply[..split]);
+            std::thread::sleep(before_body);
+            let _ = stream.write_all(&reply[split..]);
+        });
+        (
+            OpenRouter::for_test(base, None, Duration::from_millis(120)),
+            handle,
+        )
+    }
+    fn reply(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+    #[test]
+    fn actual_http_success_cache_and_non_success() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(180));
+        let dir = tempfile::tempdir().unwrap();
+        let (mut api, server) = fixture(
+            reply("200 OK", br#"{"ok":true}"#),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        api.cache_dir = Some(dir.path().to_owned());
+        let request = serde_json::json!({"model":"fixture"});
+        assert!(!api.request("chat/completions", &request).unwrap().cached);
+        server.join().unwrap();
+        // The one-shot listener is gone: this second result must come from cache.
+        let second = api.request("chat/completions", &request).unwrap();
+        assert!(second.cached);
+        assert_eq!(second.body["ok"], true);
+        let (api, server) = fixture(
+            reply("422 Unprocessable Entity", b"fixture rejected"),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let error = api
+            .request("chat/completions", &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 422") && error.contains("fixture rejected"));
+        server.join().unwrap();
+    }
+    #[test]
+    fn actual_http_does_not_follow_redirects() {
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let bytes = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", destination.local_addr().unwrap()).into_bytes();
+        let (api, server) = fixture(bytes, Duration::ZERO, Duration::ZERO);
+        assert!(
+            api.request("chat/completions", &serde_json::json!({"model":"fixture"}))
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 307")
+        );
+        server.join().unwrap();
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn actual_http_exact_body_cap_and_first_excess_byte() {
+        let mut body = b"{\"data\":\"".to_vec();
+        body.resize(MAX_RESPONSE_BYTES as usize - 2, b'a');
+        body.extend_from_slice(b"\"}");
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES as usize);
+        for excess in [false, true] {
+            let mut bytes = body.clone();
+            if excess {
+                bytes.push(b' ');
+            }
+            let (mut api, server) =
+                fixture(reply("200 OK", &bytes), Duration::ZERO, Duration::ZERO);
+            // Large local transfers need an ordinary deadline, not the deliberately
+            // short deadline used to discriminate the stall tests below.
+            api.client = http_client(CONNECT_TIMEOUT, Duration::from_secs(5)).unwrap();
+            let result = api.request("chat/completions", &serde_json::json!({"model":"fixture"}));
+            if excess {
+                assert!(result.unwrap_err().to_string().contains("exceeded 8 MiB"));
+            } else {
+                assert_eq!(
+                    result.unwrap().body["data"].as_str().unwrap().len(),
+                    MAX_RESPONSE_BYTES as usize - 11
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn actual_http_deadline_covers_slow_headers_and_body() {
+        for (headers, body) in [
+            (Duration::from_millis(350), Duration::ZERO),
+            (Duration::ZERO, Duration::from_millis(350)),
+        ] {
+            let (api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), headers, body);
+            let started = std::time::Instant::now();
+            let error = api
+                .request("chat/completions", &serde_json::json!({"model":"fixture"}))
+                .unwrap_err();
+            assert!(started.elapsed() >= Duration::from_millis(80));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+            server.join().unwrap();
+        }
     }
 }

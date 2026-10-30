@@ -128,13 +128,13 @@ skywrite image render --file title.html -o title.png --width 1280 --height 720
 skywrite image render --file card.json -o card.webp --quality 90 --font ./Brand.ttf
 ```
 
-The default renderer embeds original upstream `takumi = 2.19.0` with its `from-html` feature, not a CLI fork. No external Takumi executable, browser, FFmpeg, or system fonts are needed for this command. Rust 1.91 or newer is required to build Skywrite. An unmodified Geist variable font is embedded under its [SIL Open Font License](assets/fonts/OFL.txt); use repeated `--font PATH` to register extra local font files. Select their family in your template. Glyph coverage follows the registered fonts.
+The renderer embeds original upstream `takumi = 2.19.0` with its `from-html` feature, not a CLI fork. No external Takumi executable, browser, FFmpeg, or system fonts are needed for this command. Rust 1.91 or newer is required to build Skywrite. An unmodified Geist variable font is embedded under its [SIL Open Font License](assets/fonts/OFL.txt); use repeated `--font PATH` to register extra local font files. Select their family in your template. Glyph coverage follows the registered fonts.
 
 Templates are `.html`/`.htm` fragments or upstream Takumi JSON nodes, for example `{"type":"text","text":"Hello","style":{"fontSize":48,"color":"white"}}`. HTML supports upstream inline `style` and `tw` attributes. The stable upstream HTML entry point discards stylesheet elements, so Skywrite rejects `<style>`/`<link>` inputs with guidance to use inline styles. HTML error recovery follows upstream; this is a layout renderer with no JavaScript execution. PNG preserves alpha; WebP/JPEG accept `--quality 0..100` (default 75); PNG rejects quality because it is lossless. The format is inferred from the output extension unless supplied explicitly.
 
 Image-node `src` paths resolve relative to the template. Only local raster images are supported; remote URLs, data URIs, inline image buffers and SVG sources are unsupported. CSS background image resources are outside this interface. Rendering makes no network requests. Templates are limited to one MiB, 4096 rendered nodes and depth 64, with at most 16 megapixels on a canvas whose sides are 1..8192. Local images have the same per-image pixel budget and at most 32 megapixels combined; each font/image is at most 16 MiB, with 32 MiB combined resource bytes, at most 64 image resources and sixteen extra fonts. These are input bounds, not a hard operating-system memory or CPU quota.
 
-Native outputs are published atomically, existing files require `--overwrite`, and the template, loaded fonts and loaded images cannot be replaced by the output. Include resulting stills in the edit's primary clips. `--backend takumi-cli` retains an explicit compatibility adapter for whichever external `takumi` is on PATH; it follows that CLI's input behavior and is not required for native rendering.
+Native outputs are published atomically, existing files require `--overwrite`, and the template, loaded fonts and loaded images cannot be replaced by the output. Include resulting stills in the edit's primary clips.
 
 ## Validation
 

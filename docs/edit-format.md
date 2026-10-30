@@ -31,7 +31,10 @@ using a separate recorder. Volumes are linear gains: zero is mute, one is the
 original gain. Images are held for the requested duration, preserving their
 aspect ratio with a black background.
 
-`source_in` is measured from the source's first presented sample. `duration` is
+`source_in` is measured from the source's first presented sample (the container's
+reported presentation start). Inspection reports elapsed presentation duration:
+Matroska/WebM's ending timestamp is rebased to that start; MP4 and MPEG-TS
+already report elapsed duration. `duration` is
 always **output seconds**; `speed` is **source seconds per output second**.
 For example, a 10-second output clip at speed 1.01 consumes 10.1 source seconds.
 If synchronization reports `reference_time = offset + scale * asset_time`, use
@@ -43,7 +46,10 @@ validator reports rounding. Use rational rates such as `{"num":30000,"den":1001}
 for NTSC. FCPXML and FFmpeg retain rational timing; this initial Remotion exporter
 accepts integer FPS and rounds source trims to composition-frame boundaries.
 Audio/visual stream start offsets are preserved when FFmpeg renders selected
-source ranges. Playback-rate corrections preserve audio pitch.
+source ranges, including black video before a delayed video stream begins.
+Playback-rate corrections preserve audio pitch. MPEG-TS sampling and source
+trims decode from the beginning because transport streams may lack a reliable
+seek index; inspection still reads metadata without decoding the source.
 
 The initial format supports assembly cuts, gaps, held images, constant speed,
 source audio gain, and additional audio layers. Unknown fields and unsupported
@@ -67,7 +73,9 @@ skywrite edit export edit.json --to remotion --output remotion-project
 
 The Python script uses only the standard library and FFmpeg; it invokes FFmpeg
 with an argument list, never a shell. Both direct rendering and the script
-publish an H.264/AAC MP4. Existing output files require `--overwrite`. Rendering
+publish an H.264/AAC MP4. On POSIX, the script stops its owned FFmpeg process group on
+ordinary SIGINT/SIGTERM cancellation, timeout, or failure before removing its
+private temporary output. Existing output files require `--overwrite`. Rendering
 or exporting over an original source is rejected. Exported project directories
 must be new even when `--overwrite` is supplied, preserving authored projects.
 

@@ -134,7 +134,7 @@ struct SyncArgs {
     min_anchors: usize,
     #[arg(long, default_value_t = 10.0)]
     min_span_seconds: f64,
-    /// Maximum audio duration decoded per asset; longer inputs are rejected.
+    /// Maximum audio prefix decoded per asset; longer inputs produce a warning.
     #[arg(long, default_value_t = 3600.0)]
     max_audio_seconds: f64,
     #[command(flatten)]
@@ -195,9 +195,6 @@ enum ImageCommand {
         font: Vec<String>,
         #[arg(long)]
         overwrite: bool,
-        /// Native upstream renderer, or an explicit external compatibility adapter.
-        #[arg(long,default_value="native",value_parser=["native","takumi-cli"])]
-        backend: String,
     },
 }
 
@@ -269,7 +266,6 @@ fn execute(command: Command) -> Result<Value> {
                 ("ffprobe", "-version"),
                 ("hyperframes", "--version"),
                 ("node", "--version"),
-                ("takumi", "--help"),
             ] {
                 let result = skywrite::process::run(
                     tool,
@@ -280,7 +276,7 @@ fn execute(command: Command) -> Result<Value> {
                 tools.insert(tool.to_owned(),match result {Ok(out)=>json!({"available":true,"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")}),Err(error)=>json!({"available":false,"reason":error.to_string()})});
             }
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)","takumi (explicit legacy adapter)"],"native_image_renderer":{"name":"takumi","version":"2.19.0","available":true}}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":"2.19.0","available":true}}),
             )
         }
         Command::Inspect { inputs, output } => {
@@ -412,7 +408,6 @@ fn execute(command: Command) -> Result<Value> {
                 quality,
                 font,
                 overwrite,
-                backend,
             } => skywrite::image::render(&skywrite::image::RenderImage {
                 file: &file,
                 output: &output,
@@ -421,7 +416,6 @@ fn execute(command: Command) -> Result<Value> {
                 format: format.as_deref(),
                 quality,
                 fonts: &font,
-                backend: &backend,
                 overwrite,
             }),
         },

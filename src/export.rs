@@ -76,15 +76,36 @@ fn xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn unseeked_prefix(info: &media::MediaInfo, source_in: f64) -> f64 {
+    let before_video = info
+        .video()
+        .and_then(|video| video.start_time)
+        .is_some_and(|start| source_in < start - info.start_time);
+    // TS has no reliable random-access index; input seeking can miss the
+    // only usable keyframe. This affects rendering, never metadata inspection.
+    if before_video || info.format_name.split(',').any(|name| name == "mpegts") {
+        source_in
+    } else {
+        0.0
+    }
+}
+
 fn audio_segment(
     input: usize,
     info: &media::MediaInfo,
-    source_in: f64,
+    source_times: (f64, f64),
     duration: f64,
     speed: f64,
     volume: f64,
     label: &str,
 ) -> String {
+    let (source_in, unseeked_prefix) = source_times;
+    let trim = (unseeked_prefix
+        - info
+            .audio()
+            .map(|audio| audio.start_time.unwrap_or(info.start_time) - info.start_time)
+            .unwrap_or(0.0))
+    .max(0.0);
     let lead = info
         .audio()
         .map(|audio| {
@@ -104,7 +125,8 @@ fn audio_segment(
     let source_samples = (content * 48000.0).round() as u64;
     let output_samples = (duration * 48000.0).round() as u64;
     format!(
-        "[{input}:a:0]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,volume={},adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB[{label}]",
+        "[{input}:a:0]asetpts=PTS-STARTPTS,atrim=start={},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,volume={},adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB[{label}]",
+        number(trim),
         tempo(speed),
         number(volume)
     )
@@ -141,6 +163,11 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                     .context("validated source missing")?
                     .to_str()
                     .context("source path is not UTF-8")?;
+                let unseeked_prefix = clip
+                    .media
+                    .as_ref()
+                    .map(|info| unseeked_prefix(info, clip.source_in))
+                    .unwrap_or(0.0);
                 if clip.kind == MediaKind::Image {
                     push(
                         &mut args,
@@ -158,13 +185,17 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                         ],
                     );
                 } else {
+                    // Seeking to a video keyframe can skip audio before that
+                    // frame, even with -ss 0. Decode a pre-video prefix from
+                    // the beginning and trim its audio in the shared filter.
+                    if clip.source_in > 0.0 && unseeked_prefix == 0.0 {
+                        push(&mut args, &["-ss", &number(clip.source_in)]);
+                    }
                     push(
                         &mut args,
                         &[
-                            "-ss",
-                            &number(clip.source_in),
                             "-t",
-                            &number(duration * clip.speed),
+                            &number(duration * clip.speed + unseeked_prefix),
                             "-protocol_whitelist",
                             "file,pipe",
                             "-i",
@@ -172,6 +203,19 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                         ],
                     );
                 }
+                let video_trim = clip
+                    .media
+                    .as_ref()
+                    .map(|info| {
+                        (unseeked_prefix
+                            - info
+                                .video()
+                                .and_then(|video| video.start_time)
+                                .unwrap_or(info.start_time)
+                            + info.start_time)
+                            .max(0.0)
+                    })
+                    .unwrap_or(0.0);
                 let video_lead = clip
                     .media
                     .as_ref()
@@ -184,13 +228,23 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                         })
                     })
                     .unwrap_or(0.0);
-                filters.push(format!("[{input}:v:0]tpad=start_mode=add:start_duration={}:color=black,setpts=(PTS-STARTPTS)/{},fps={},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,tpad=stop_mode=clone:stop_duration=1,trim=duration={},settb=AVTB[v{}]",number(video_lead),number(clip.speed),fps,edit.width,edit.height,edit.width,edit.height,seconds,index));
+                if video_lead >= duration * clip.speed {
+                    // An audio-only prefix has no video frame to seed tpad.
+                    filters.push(format!(
+                        "color=c=black:s={}x{}:r={}:d={},settb=AVTB[v{}]",
+                        edit.width, edit.height, fps, seconds, index
+                    ));
+                } else {
+                    // Rebase incoming PTS before adding the explicit prefix,
+                    // or the source's video delay is counted twice.
+                    filters.push(format!("[{input}:v:0]setpts=PTS-STARTPTS,trim=start={},setpts=PTS-STARTPTS,tpad=start_mode=add:start_duration={}:color=black,setpts=PTS/{},fps={},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,tpad=stop_mode=clone:stop_duration=1,trim=duration={},settb=AVTB[v{}]",number(video_trim),number(video_lead),number(clip.speed),fps,edit.width,edit.height,edit.width,edit.height,seconds,index));
+                }
                 if clip.media.as_ref().is_some_and(media::MediaInfo::has_audio) && clip.volume > 0.0
                 {
                     filters.push(audio_segment(
                         input,
                         clip.media.as_ref().context("validated media missing")?,
-                        clip.source_in,
+                        (clip.source_in, unseeked_prefix),
                         duration,
                         clip.speed,
                         clip.volume,
@@ -211,13 +265,15 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
     filters.push(concat);
     for (index, clip) in edit.audio.iter().enumerate() {
         let duration = edit.fps.seconds(clip.duration_frames);
+        let prefix = unseeked_prefix(&clip.media, clip.source_in);
+        if clip.source_in > 0.0 && prefix == 0.0 {
+            push(&mut args, &["-ss", &number(clip.source_in)]);
+        }
         push(
             &mut args,
             &[
-                "-ss",
-                &number(clip.source_in),
                 "-t",
-                &number(duration * clip.speed),
+                &number(duration * clip.speed + prefix),
                 "-protocol_whitelist",
                 "file,pipe",
                 "-i",
@@ -228,7 +284,7 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
         filters.push(audio_segment(
             input,
             &clip.media,
-            clip.source_in,
+            (clip.source_in, prefix),
             duration,
             clip.speed,
             clip.volume,
@@ -358,12 +414,64 @@ Run: python3 render.py --output edit.mp4 [--overwrite]
 import argparse
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
 PLAN = json.loads({literal})
+
+CANCELLED = None
+
+def cancel(signum, frame):
+    # Recording covers spawn assignment and private output publication without
+    # raising in either critical section. The owner observes it before publish.
+    global CANCELLED
+    CANCELLED = signum
+
+def run_ffmpeg(args):
+    child = None
+    try:
+        child = subprocess.Popen(['ffmpeg', *args], stdin=subprocess.DEVNULL,
+                                 start_new_session=(os.name == 'posix'))
+        deadline = time.monotonic() + PLAN['timeout_seconds']
+        while True:
+            if CANCELLED is not None:
+                raise SystemExit(128 + CANCELLED)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(child.args, PLAN['timeout_seconds'])
+            try:
+                code = child.wait(timeout=min(0.1, remaining))
+                if CANCELLED is not None:
+                    raise SystemExit(128 + CANCELLED)
+                if code:
+                    raise subprocess.CalledProcessError(code, child.args)
+                return
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise
+    finally:
+        if child is not None:
+            # Descendants may still hold the output open after the leader exits.
+            # Complete group cleanup before unlinking/publishing private output.
+            def terminate(sig):
+                try:
+                    if os.name == 'posix':
+                        os.killpg(child.pid, sig)
+                    elif child.poll() is None:
+                        child.kill() if sig == getattr(signal, 'SIGKILL', None) else child.terminate()
+                except ProcessLookupError:
+                    pass
+            terminate(signal.SIGTERM)
+            try:
+                child.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            terminate(getattr(signal, 'SIGKILL', signal.SIGTERM))
+            child.wait()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -375,12 +483,15 @@ def main():
         raise ValueError('output must not replace original source media')
     if output.exists() and not options.overwrite:
         raise FileExistsError('output exists; pass --overwrite')
+    handlers = {{sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM)}}
     fd, temporary = tempfile.mkstemp(prefix='.skywrite-render-', suffix='.mp4', dir=output.parent)
     os.close(fd)
     try:
         args = PLAN['args'].copy()
         args[-1] = temporary
-        subprocess.run(['ffmpeg', *args], check=True, timeout=PLAN['timeout_seconds'], stdin=subprocess.DEVNULL)
+        run_ffmpeg(args)
+        if CANCELLED is not None:
+            raise SystemExit(128 + CANCELLED)
         if options.overwrite:
             os.replace(temporary, output)
         else:
@@ -390,6 +501,8 @@ def main():
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 if __name__ == '__main__':
     try:

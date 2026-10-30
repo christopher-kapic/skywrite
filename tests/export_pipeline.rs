@@ -397,3 +397,238 @@ fn delayed_stream_presentation_times_survive_trim_and_retime() {
         }
     }
 }
+
+#[test]
+fn delayed_video_prefix_is_counted_once_in_both_renderers() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("delayed-video.mkv");
+    command(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=160x90:r=25:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-filter:v",
+            "setpts=PTS+1/TB",
+            "-c:v",
+            "ffv1",
+            "-threads",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            input.to_str().unwrap(),
+        ],
+    );
+    for (index, (source_in, speed, duration, fps)) in [
+        (0.0, 0.5, 4.0, Rational { num: 30, den: 1 }),
+        (0.0, 1.0, 2.0, Rational { num: 30, den: 1 }),
+        (0.0, 2.0, 1.5, Rational { num: 30, den: 1 }),
+        (
+            0.5,
+            1.0,
+            2.0,
+            Rational {
+                num: 30000,
+                den: 1001,
+            },
+        ),
+        (1.5, 1.0, 1.0, Rational { num: 30, den: 1 }),
+        (0.0, 1.0, 0.5, Rational { num: 30, den: 1 }),
+        (0.5, 0.5, 0.5, Rational { num: 30, den: 1 }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut specification = edit();
+        specification.audio.clear();
+        specification.fps = fps;
+        specification.clips = vec![Clip {
+            source: Some(input.clone()),
+            source_in,
+            duration,
+            speed,
+            volume: 1.0,
+        }];
+        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        let script = dir.path().join(format!("video-{index}.py"));
+        export::export(&validated, "ffmpeg", &script, false).unwrap();
+        for python in [false, true] {
+            let output = dir.path().join(format!("video-{index}-{python}.mp4"));
+            if python {
+                command(
+                    "python3",
+                    &[
+                        script.to_str().unwrap(),
+                        "--output",
+                        output.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                export::render(&validated, &output, false).unwrap();
+            }
+            let onset = ((1.0 - source_in) / speed).max(0.0);
+            if onset > 0.1 {
+                let black = center(&output, &(onset.min(duration) * 0.5).to_string());
+                assert!(
+                    black.iter().all(|v| *v < 10),
+                    "early picture source_in={source_in} speed={speed} python={python}: {black:?}"
+                );
+            }
+            if onset + 0.2 < duration {
+                let red = center(&output, &(onset + 0.15).to_string());
+                assert!(
+                    red[0] > 200 && red[1] < 20 && red[2] < 20,
+                    "late picture source_in={source_in} speed={speed} python={python}: {red:?}"
+                );
+            }
+            assert!(
+                rms(&output, "0.05", "0.1") > 0.03,
+                "audio missing from video prefix: index={index} python={python} source_in={source_in} speed={speed}"
+            );
+            assert!((media::probe(&output).unwrap().duration - validated.duration()).abs() < 0.06);
+        }
+    }
+}
+
+#[test]
+fn additional_audio_preserves_content_before_delayed_video() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("audio-before-video.mkv");
+    command(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=160x90:r=30:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-vf",
+            "setpts=PTS+1/TB",
+            "-c:v",
+            "ffv1",
+            "-threads",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            source.to_str().unwrap(),
+        ],
+    );
+    for (index, source_in) in [0.0, 0.5].into_iter().enumerate() {
+        let mut specification = edit();
+        specification.clips = vec![Clip {
+            source: None,
+            source_in: 0.0,
+            duration: 0.5,
+            speed: 1.0,
+            volume: 1.0,
+        }];
+        specification.audio = vec![AudioClip {
+            source: source.clone(),
+            source_in,
+            offset: 0.0,
+            duration: 0.5,
+            speed: 1.0,
+            volume: 1.0,
+        }];
+        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        let script = dir.path().join(format!("audio-prefix-{index}.py"));
+        export::export(&validated, "ffmpeg", &script, false).unwrap();
+        for python in [false, true] {
+            let output = dir
+                .path()
+                .join(format!("audio-prefix-{index}-{python}.mp4"));
+            if python {
+                command(
+                    "python3",
+                    &[
+                        script.to_str().unwrap(),
+                        "--output",
+                        output.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                export::render(&validated, &output, false).unwrap();
+            }
+            assert!(
+                rms(&output, "0.05", "0.1") > 0.03,
+                "additional audio prefix missing source_in={source_in} python={python}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn python_renderer_cleans_owned_groups_on_cancel_timeout_and_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    make_fixtures(dir.path());
+    let validated = timeline::validate(&edit(), dir.path()).unwrap();
+    let script = dir.path().join("render.py");
+    export::export(&validated, "ffmpeg", &script, false).unwrap();
+    let probe = r#"import os,sys,pathlib,subprocess,time,signal,stat,json
+root=pathlib.Path(sys.argv[1]); script=root/'render.py'
+helper=root/'ffmpeg'
+helper.write_text('''#!/usr/bin/env python3
+import os,sys,time,signal,subprocess,pathlib
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+marker=pathlib.Path(os.environ['MARKER'])
+child=subprocess.Popen([sys.executable,'-c', 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(12)'])
+marker.write_text(str(os.getpid())+' '+str(child.pid))
+if os.environ['MODE']=='failure': sys.exit(7)
+if os.environ['MODE']=='success': sys.exit(0)
+time.sleep(12)
+''');helper.chmod(0o700)
+def live(pid):
+ try: return pathlib.Path('/proc/'+str(pid)+'/stat').read_text().split()[2]!='Z'
+ except FileNotFoundError: return False
+for mode in ['term','int','timeout','failure','success']:
+ marker=root/('pids-'+mode);output=root/('output-'+mode+'.mp4');output.write_bytes(b'protected')
+ env=os.environ.copy();env.update(PATH=str(root)+os.pathsep+env['PATH'],MARKER=str(marker),MODE=mode)
+ driver="import runpy,sys; m=runpy.run_path(sys.argv[1]); m['PLAN']['timeout_seconds']=0.4; sys.argv=[sys.argv[1], '--output',sys.argv[2],'--overwrite']; m['main']()"
+ p=subprocess.Popen([sys.executable,'-c',driver,str(script),str(output)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+ pids=[]
+ try:
+  end=time.monotonic()+3
+  while not marker.exists() and p.poll() is None and time.monotonic()<end:time.sleep(0.01)
+  assert marker.exists(),mode+' child not started'
+  pids=list(map(int,marker.read_text().split()))
+  if mode in ['term','int']:p.send_signal(signal.SIGTERM if mode=='term' else signal.SIGINT)
+  stdout,stderr=p.communicate(timeout=3)
+  if mode=='success': assert p.returncode==0,(mode,p.returncode,stderr)
+  else: assert p.returncode!=0,(mode,p.returncode,stderr)
+  end=time.monotonic()+1
+  while any(map(live,pids)) and time.monotonic()<end:time.sleep(.01)
+  assert not any(map(live,pids)),(mode,'live owned processes',pids)
+  assert not list(root.glob('.skywrite-render-*')),(mode,'temporary output leaked')
+  if mode!='success':assert output.read_bytes()==b'protected',mode+' replaced existing output'
+ finally:
+  if p.poll() is None:p.kill();p.wait()
+  if pids:
+   try:os.killpg(pids[0],signal.SIGKILL)
+   except ProcessLookupError:pass
+# Real exported entrypoint protects source and refuses clobber before FFmpeg.
+for output in [root/"speaker's $(touch HACKED) & <take>.mp4",root/'existing.mp4']:
+ if output.name=='existing.mp4':output.write_bytes(b'kept')
+ before=output.read_bytes()
+ p=subprocess.run([sys.executable,str(script),'--output',str(output)],capture_output=True,timeout=3)
+ assert p.returncode!=0 and output.read_bytes()==before
+print('five lifecycle modes and source/no-clobber controls passed')
+"#;
+    command("python3", &["-c", probe, dir.path().to_str().unwrap()]);
+}

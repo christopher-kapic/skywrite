@@ -79,9 +79,26 @@ The provider word-order issue was subsequently fixed in ingestion. Replaying the
 identical failed array response from cache without an API key succeeded with all
 42 original word text/start/end values preserved, chronological starts, and an
 explicit reordering diagnostic. This replay checks the actual saved provider
-response; it does not issue or charge another request.
+response; it does not issue or charge another request. The whole transcript text is
+trimmed at its outer whitespace; the preservation claim applies to provider word
+text/start/end triples, not byte identity of the whole text.
 
 Per-request logs, raw cached responses, source annotations, cost records and the
 rendered demonstration from that run were saved outside git under
 `/tmp/skywrite-run/public`. Subsequent implementation fixes require fresh
 validation; this dated evidence does not certify later source changes.
+
+
+The offline regression suite also exercises native Takumi HTML/JSON rendering
+with an empty executable PATH, local font/image preservation and PNG/WebP/JPEG
+output. The obsolete external Takumi CLI adapter has been removed.
+
+On Linux, subprocess regressions use controlled local child process groups to
+check ordinary SIGINT/SIGTERM cancellation, deadlines, bounded capture, reader
+joins and repeated concurrent failure/success cleanup. The supervisor keeps one
+signal notification thread per process; calls do not accumulate readers or file
+descriptors. Signal exit keeps the normal signal status, after active helper
+groups have been killed and direct children reaped. SIGKILL, machine failure and
+descendants that deliberately leave their assigned process group are outside
+this cleanup guarantee. Secondary operating systems and the declared Rust 1.91
+minimum require separate validation; the local pass uses Linux/current Rust.

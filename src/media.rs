@@ -94,11 +94,32 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
     if streams.is_empty() {
         bail!("media contains no streams");
     }
+    let start_time = number(format, "start_time").unwrap_or(0.0);
+    let format_name = format["format_name"].as_str().unwrap_or("unknown");
+    // FFmpeg's Matroska/WebM demuxer exposes Segment Duration as an ending
+    // presentation timestamp (the muxer includes a nonzero timestamp origin).
+    // MOV/MP4 and MPEG-TS instead expose elapsed format duration. Never apply
+    // the Matroska correction to those demuxers. This uses header metadata only;
+    // inspection must not scan/decode the complete source.
+    let matroska = format_name
+        .split(',')
+        .any(|name| name == "matroska" || name == "webm");
     let duration = number(format, "duration")
+        .map(|duration| {
+            if matroska {
+                duration - start_time
+            } else {
+                duration
+            }
+        })
         .or_else(|| {
             streams
                 .iter()
-                .filter_map(|s| s.duration)
+                .filter_map(|stream| {
+                    stream.duration.map(|duration| {
+                        stream.start_time.unwrap_or(start_time) + duration - start_time
+                    })
+                })
                 .max_by(f64::total_cmp)
         })
         .unwrap_or(0.0);
@@ -108,12 +129,9 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
     Ok(MediaInfo {
         path: path.clone(),
         duration,
-        start_time: number(format, "start_time").unwrap_or(0.0),
+        start_time,
         size_bytes: std::fs::metadata(&path)?.len(),
-        format_name: format["format_name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_owned(),
+        format_name: format_name.to_owned(),
         streams,
     })
 }
@@ -163,13 +181,17 @@ pub fn sample_frames(
             "error",
             "-nostdin",
             "-n",
-            "-ss",
-            &time.to_string(),
             "-protocol_whitelist",
             "file,pipe",
             "-i",
         ]);
+        if !info.format_name.split(',').any(|name| name == "mpegts") {
+            args.splice(5..5, crate::process::args(&["-ss", &time.to_string()]));
+        }
         args.push(info.path.clone().into_os_string());
+        if info.format_name.split(',').any(|name| name == "mpegts") {
+            args.extend(crate::process::args(&["-ss", &time.to_string()]));
+        }
         args.extend(crate::process::args(&[
             "-map",
             "0:v:0",

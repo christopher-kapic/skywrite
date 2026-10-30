@@ -137,6 +137,7 @@ fn native_json_local_raster_and_font_resources() {
     assert_eq!(pixels(&out), raw);
     let ownfont = d.path().join("font.woff2");
     std::fs::copy(&font, &ownfont).unwrap();
+    let original_font = std::fs::read(&ownfont).unwrap();
     failure(
         render(
             &input,
@@ -151,6 +152,7 @@ fn native_json_local_raster_and_font_resources() {
         ),
         "overwrite an input",
     );
+    assert_eq!(std::fs::read(&ownfont).unwrap(), original_font);
 }
 
 #[test]
@@ -246,4 +248,19 @@ fn native_rejects_non_regular_input_and_protects_symlink_targets() {
     failure(render(&input, &out, &["--overwrite"]), "overwrite an input");
     assert_eq!(std::fs::read_to_string(&input).unwrap(), "<div>Hello</div>");
     assert!(out.is_symlink());
+}
+
+#[test]
+fn retired_external_backend_is_rejected_before_any_input_write() {
+    let d = tempfile::tempdir().unwrap();
+    let input = d.path().join("source.html");
+    let original = b"<div>preserve source</div>";
+    std::fs::write(&input, original).unwrap();
+    let out = render(
+        &input,
+        &input,
+        &["--backend", "takumi-cli", "--format", "png", "--overwrite"],
+    );
+    failure(out, "unexpected argument '--backend'");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
 }

@@ -1,10 +1,9 @@
-//! Native upstream Takumi rendering and an explicit legacy CLI adapter.
+//! Native upstream Takumi rendering.
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
 use takumi::prelude::{
     FontResource, Fonts, FromHtmlOptions, ImageSource, ImageSourceInput, Node, NodeKind,
@@ -24,10 +23,9 @@ pub struct RenderImage<'a> {
     pub height: u32,
     pub format: Option<&'a str>,
     pub quality: Option<u8>,
-    /// Individual local font files for native rendering; CLI adapter accepts its own globs.
+    /// Individual local font files for native rendering.
     pub fonts: &'a [String],
     pub overwrite: bool,
-    pub backend: &'a str,
 }
 
 /// Open without waiting on FIFOs and enforce the byte budget while reading.
@@ -97,13 +95,9 @@ pub fn render(options: &RenderImage<'_>) -> Result<Value> {
     if format == "png" && options.quality.is_some() {
         bail!("--quality applies only to JPEG and WebP");
     }
-    match options.backend {
-        "native" => native(options, &source, &bytes, format)?,
-        "takumi-cli" => external(options, &source, format)?,
-        _ => bail!("image backend must be native or takumi-cli"),
-    }
+    native(options, &source, &bytes, format)?;
     Ok(
-        json!({"path":options.output.canonicalize()?,"width":options.width,"height":options.height,"format":format,"renderer":if options.backend == "native" {"takumi"} else {"takumi-cli"},"renderer_version":if options.backend == "native" {Some("2.19.0")} else {None},"template":source}),
+        json!({"path":options.output.canonicalize()?,"width":options.width,"height":options.height,"format":format,"renderer":"takumi","renderer_version":"2.19.0","template":source}),
     )
 }
 
@@ -290,52 +284,5 @@ fn resolve_nodes(
         NodeKind::Text(_) => (),
         _ => bail!("unsupported upstream node kind"),
     }
-    Ok(())
-}
-
-fn external(options: &RenderImage<'_>, source: &Path, format: &str) -> Result<()> {
-    let parent = options
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let temp = tempfile::tempdir_in(parent)?;
-    let rendered = temp.path().join(format!("image.{format}"));
-    let mut args = crate::process::args(&["--file"]);
-    args.push(source.as_os_str().to_os_string());
-    args.extend(crate::process::args(&["--output"]));
-    args.push(rendered.clone().into_os_string());
-    args.extend(crate::process::args(&[
-        "--width",
-        &options.width.to_string(),
-        "--height",
-        &options.height.to_string(),
-        "--format",
-        format,
-    ]));
-    if let Some(quality) = options.quality {
-        args.extend(crate::process::args(&["--quality", &quality.to_string()]));
-    }
-    for font in options.fonts {
-        args.push(format!("--font={font}").into());
-    }
-    crate::process::run("takumi", &args, Duration::from_secs(120), 1024 * 1024)
-        .context("rendering still asset with optional Takumi CLI")?;
-    let metadata = crate::media::probe(&rendered)?;
-    let video = metadata
-        .video()
-        .context("Takumi did not produce a decodable image")?;
-    if video.width != Some(options.width) || video.height != Some(options.height) {
-        bail!("Takumi output dimensions differ from requested dimensions");
-    }
-    if metadata.size_bytes > 64 * 1024 * 1024 {
-        bail!("Takumi output exceeds 64 MiB");
-    }
-    crate::io::atomic_write(
-        options.output,
-        &std::fs::read(&rendered)?,
-        options.overwrite,
-    )?;
     Ok(())
 }
