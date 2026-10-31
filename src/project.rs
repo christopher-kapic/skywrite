@@ -490,33 +490,19 @@ fn input_inventory(l: &Loaded) -> Result<BTreeMap<PathBuf, PathBuf>> {
     Ok(logical)
 }
 fn input_digest(reader: impl Read, limit: u64) -> Result<(String, u64)> {
-    use sha2::{Digest, Sha256};
-    // Metadata is only early admission. A concurrently growing file cannot
-    // exceed the actual-byte bound; read one sentinel byte to detect overflow.
-    let mut reader = reader.take(limit + 1);
-    let mut hash = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        #[cfg(test)]
-        INPUT_HASH_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
-        if count == 0 {
-            break;
+    #[cfg(test)]
+    struct Observed<R>(R);
+    #[cfg(test)]
+    impl<R: Read> Read for Observed<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.0.read(buf)?;
+            INPUT_HASH_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
+            Ok(count)
         }
-        total += count as u64;
-        if total > limit {
-            bail!("project image input exceeds admitted byte limit");
-        }
-        hash.update(&buffer[..count]);
     }
-    Ok((
-        hash.finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-        total,
-    ))
+    #[cfg(test)]
+    let reader = Observed(reader);
+    crate::media::hash_reader_bounded(reader, limit)
 }
 fn inputs(l: &Loaded) -> Result<BTreeMap<PathBuf, String>> {
     let logical = input_inventory(l)?;

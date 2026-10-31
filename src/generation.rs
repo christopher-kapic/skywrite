@@ -341,9 +341,19 @@ fn artifact_path(dir: &Path, a: &Artifact) -> Result<PathBuf> {
     if a.media_type != expected_mime {
         bail!("job artifact filename disagrees with MIME metadata");
     }
+    let max_bytes = match a.media_type.as_str() {
+        "video/mp4" => MAX_VIDEO,
+        "audio/mpeg" | "audio/wav" => crate::audio_generation::MAX_AUDIO as u64,
+        _ => MAX_IMAGE as u64,
+    };
+    if a.bytes > max_bytes {
+        bail!("job artifact exceeds its media byte limit");
+    }
     let path = dir.join(&a.file);
     let f = open_regular(&path, false)?;
-    if f.metadata()?.len() != a.bytes || crate::media::file_sha256(&path)? != a.sha256 {
+    if f.metadata()?.len() != a.bytes
+        || crate::media::file_sha256_limited(&path, a.bytes)? != a.sha256
+    {
         bail!("job artifact integrity check failed");
     }
     Ok(path)
@@ -1332,7 +1342,7 @@ fn complete_image(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
     }
     temp.persist(dir.join(&file)).map_err(|e| e.error)?;
     job.artifact = Some(Artifact {
-        sha256: crate::media::file_sha256(&dir.join(&file))?,
+        sha256: crate::media::file_sha256_limited(&dir.join(&file), bytes.len() as u64)?,
         file,
         media_type: mime.into(),
         bytes: bytes.len() as u64,
@@ -1406,7 +1416,7 @@ fn refresh_video(dir: &Path, job: &mut Job, transport: &Transport, wait: u64) ->
                 save_job(dir, job)?;
                 bail!("{}; job {}", job.error.as_deref().unwrap(), job.id);
             }
-            let sha256 = crate::media::file_sha256(temp.path())?;
+            let sha256 = crate::media::file_sha256_limited(temp.path(), MAX_VIDEO)?;
             let bytes = temp.as_file().metadata()?.len();
             temp.persist(dir.join("result.mp4")).map_err(|e| e.error)?;
             job.artifact = Some(Artifact {
@@ -1471,7 +1481,9 @@ pub(crate) fn verify_project_publication(id: &str, output: &Path) -> Result<Valu
         .path()
         .join(output.file_name().context("output has no filename")?);
     publish(&dir, &job, &expected, false)?;
-    if crate::media::file_sha256(output)? != crate::media::file_sha256(&expected)? {
+    if crate::media::file_sha256_limited(output, fs::metadata(&expected)?.len())?
+        != crate::media::file_sha256(&expected)?
+    {
         bail!("existing output does not match recorded job publication");
     }
     File::open(output)?.sync_all()?;

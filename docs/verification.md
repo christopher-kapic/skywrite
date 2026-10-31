@@ -49,3 +49,11 @@ supplied transcripts and their media. Audible cuts inside supplied words produce
 advisory stderr warnings; intentional B-roll and J/L cuts remain valid. The saved
 result remains Edit v1. The requested editing-model call occurs only after local
 input admission and source checks.
+
+Content hashes use the opened regular file's size as a finite read boundary, with
+one extra byte to detect growth. Verification and exact audio timing additionally
+enforce their 16 GiB hash limit on the opened file and on actual reads. A file
+that grows or shrinks during a hash is rejected instead of being followed to an
+indefinitely moving EOF. This does not impose a global size limit on stable
+original media used by other commands. Filesystem scheduling is separate from
+FFmpeg's decode deadlines.

@@ -111,7 +111,7 @@ pub fn sampled_frames(
                         }))
                     .abs()
                         > 1e-8
-                    || crate::media::file_sha256(&path)? != frame.sha256
+                    || crate::media::file_sha256_limited(&path, 1024 * 1024)? != frame.sha256
                 {
                     bail!("frame cache integrity check failed; remove the affected cache entry");
                 }
@@ -135,7 +135,7 @@ pub fn sampled_frames(
             }
             Ok(CachedFrame {
                 time: f.time,
-                sha256: crate::media::file_sha256(&f.path)?,
+                sha256: crate::media::file_sha256_limited(&f.path, 1024 * 1024)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;

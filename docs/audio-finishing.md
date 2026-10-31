@@ -33,3 +33,9 @@ Existing outputs require `--overwrite`. Every consumed input, including the side
 Resource limits are one GiB per source/output, one hour of decoded source/final audio, eight input channels, 192-kHz input, 128 loop repetitions, tempo 0.25–4, crossfades 0–30 seconds and finite validated numeric parameters. Processing stages share a 15-minute deadline, each supervised FFmpeg process is capped at ten minutes and one MiB diagnostic output. Exact timing uses the existing bounded six-hour/ten-minute decoder and bounded cache-lock waits; its wall time is additional to processing stages. No decoded PCM is captured on stdout. Temporary disk usage can include several WAV intermediates (up to several GiB at the maximum duration).
 
 For an existing Pip-style film, finish each voice section, assemble voice placements using edit audio offsets, then loop a music cue and duck it against the assembled narration stem. Keep the measured per-section durations with the edit instead of inferring them from MP3 metadata. See [audio generation](audio-generation.md) and [edit format](edit-format.md).
+
+Final source and sidechain hash checks enforce the one-GiB input limit before
+reading, and bound actual reads even if a file grows after the initial metadata
+check. Changed sources fail before publication. Hashing stable original media
+in other commands remains bounded to that file's opened size, without a global
+one-GiB restriction.

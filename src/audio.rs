@@ -532,11 +532,11 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
         bail!("encoded audio format does not match requested extension");
     }
     // Recheck every source identity before the single publication boundary.
-    if crate::media::file_sha256(&source)? != source_timing.source_sha256 {
+    if !source_identity_matches(&source, &source_timing.source_sha256, MAX_BYTES)? {
         bail!("source changed during audio finishing");
     }
     if let (Some(side), Some(timing)) = (&options.sidechain, &side_timing)
-        && crate::media::file_sha256(side)? != timing.source_sha256
+        && !source_identity_matches(side, &timing.source_sha256, MAX_BYTES)?
     {
         bail!("sidechain changed during audio finishing");
     }
@@ -558,4 +558,32 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     Ok(
         json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),
     )
+}
+
+fn source_identity_matches(path: &std::path::Path, expected: &str, limit: u64) -> Result<bool> {
+    Ok(crate::media::file_sha256_limited(path, limit)? == expected)
+}
+#[cfg(test)]
+mod hash_boundary_tests {
+    use super::*;
+    #[test]
+    fn finishing_recheck_enforces_source_and_sidechain_hash_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["source", "sidechain"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"abcdefgh").unwrap();
+            let hash = crate::media::file_sha256(&path).unwrap();
+            assert!(source_identity_matches(&path, &hash, 16).unwrap());
+            // An original admission saw8bytes; source grew before final recheck.
+            std::fs::write(&path, vec![42; 2 * 1024 * 1024]).unwrap();
+            crate::media::hash_tests::READ_BYTES.with(|n| n.set(0));
+            assert!(
+                source_identity_matches(&path, &hash, 16)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("admitted byte limit")
+            );
+            assert_eq!(crate::media::hash_tests::READ_BYTES.with(|n| n.get()), 0);
+        }
+    }
 }

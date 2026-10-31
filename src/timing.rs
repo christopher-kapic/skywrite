@@ -29,27 +29,8 @@ pub fn decoder_identity() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 fn source_hash(info: &crate::media::MediaInfo) -> Result<String> {
-    if std::fs::metadata(&info.path)?.len() > 16 * 1024 * 1024 * 1024 {
-        bail!("exact timing source exceeds 16 GiB work limit");
-    }
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(&info.path)?.take(16 * 1024 * 1024 * 1024 + 1);
-    let mut hash = Sha256::new();
-    let mut total = 0u64;
-    let mut buf = [0u8; 65536];
-    loop {
-        let count = file.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        total += count as u64;
-        if total > 16 * 1024 * 1024 * 1024 {
-            bail!("exact timing source exceeds 16 GiB work limit");
-        }
-        hash.update(&buf[..count]);
-    }
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    crate::media::file_sha256_limited(&info.path, 16 * 1024 * 1024 * 1024)
+        .context("exact timing source exceeds 16 GiB work limit or changed during hashing")
 }
 pub fn measure_audio(info: &crate::media::MediaInfo) -> Result<AudioTiming> {
     let info = crate::media::probe(&info.path)?;

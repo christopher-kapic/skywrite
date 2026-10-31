@@ -37,6 +37,9 @@ impl std::fmt::Display for CheckFailed {
 }
 impl std::error::Error for CheckFailed {}
 pub fn execute(args: VerifyArgs) -> Result<Value> {
+    execute_with_limit(args, 16 * 1024 * 1024 * 1024)
+}
+fn execute_with_limit(args: VerifyArgs, hash_limit: u64) -> Result<Value> {
     if !args.duration_tolerance.is_finite()
         || args.duration_tolerance < 0.0
         || !args.fps_tolerance.is_finite()
@@ -61,10 +64,12 @@ pub fn execute(args: VerifyArgs) -> Result<Value> {
         }
     }
     let info = crate::media::probe(&args.input)?;
-    if info.size_bytes > 16 * 1024 * 1024 * 1024 {
+    #[cfg(test)]
+    hash_boundary_tests::after_probe();
+    if info.size_bytes > hash_limit {
         bail!("verification source exceeds 16 GiB work limit");
     }
-    let hash = crate::media::file_sha256(&info.path)?;
+    let hash = crate::media::file_sha256_limited(&info.path, info.size_bytes.min(hash_limit))?;
     let audio = if !args.metadata_only && info.has_audio() {
         Some(crate::timing::measure_audio(&info)?)
     } else {
@@ -75,7 +80,7 @@ pub fn execute(args: VerifyArgs) -> Result<Value> {
     } else {
         None
     };
-    if crate::media::file_sha256(&info.path)? != hash {
+    if crate::media::file_sha256_limited(&info.path, info.size_bytes.min(hash_limit))? != hash {
         bail!("source changed during verification");
     }
     let measured_duration = match (&audio, &video) {
@@ -188,4 +193,73 @@ fn decode_video(info: &crate::media::MediaInfo) -> Result<Value> {
     Ok(
         json!({"full_decode_executed":true,"frames":frames as u64,"presentation_end_seconds":end,"decoder":crate::timing::decoder_identity()?}),
     )
+}
+
+#[cfg(test)]
+mod hash_boundary_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io::Write;
+    thread_local! { static AFTER_PROBE: RefCell<Option<Box<dyn FnOnce()>>> = const {RefCell::new(None)}; }
+    pub(super) fn after_probe() {
+        let callback = AFTER_PROBE.with(|s| s.borrow_mut().take());
+        if let Some(f) = callback {
+            f();
+        }
+    }
+    #[test]
+    fn metadata_only_verify_enforces_hash_cap_after_real_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.wav");
+        let mut args = crate::process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "0.01",
+        ]);
+        args.push(path.clone().into_os_string());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(10), 65536).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < 4096);
+        let changed = path.clone();
+        AFTER_PROBE.with(|s| {
+            *s.borrow_mut() = Some(Box::new(move || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(changed)
+                    .unwrap()
+                    .write_all(&[42; 16384])
+                    .unwrap();
+            }))
+        });
+        crate::media::hash_tests::READ_BYTES.with(|n| n.set(0));
+        let error = execute_with_limit(
+            VerifyArgs {
+                input: path,
+                metadata_only: true,
+                expected_duration: None,
+                duration_tolerance: 0.05,
+                expected_width: None,
+                expected_height: None,
+                expected_fps: None,
+                fps_tolerance: 0.01,
+                output: None,
+                overwrite: false,
+            },
+            4096,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("admitted byte limit"), "{error}");
+        assert_eq!(
+            crate::media::hash_tests::READ_BYTES.with(|n| n.get()),
+            0,
+            "re-probed metadata cap must precede any hash read"
+        );
+    }
 }

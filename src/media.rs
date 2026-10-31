@@ -271,26 +271,222 @@ pub fn extract_audio(info: &MediaInfo, output: &Path, start: f64, duration: f64)
     Ok(())
 }
 
-/// Streaming content identity used to reject transcripts attached to changed media.
+/// Content identity for a stable regular file. Work is bounded to its opened
+/// size plus one growth-detection byte, without an arbitrary large-media cap.
 pub fn file_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    file_hash(path, None)
+}
+/// Hash a regular file only within a caller's explicit byte admission policy.
+pub fn file_sha256_limited(path: &Path, max_bytes: u64) -> Result<String> {
+    file_hash(path, Some(max_bytes))
+}
+fn file_hash(path: &Path, max_bytes: Option<u64>) -> Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         bail!("content hashing requires a regular local file");
     }
+    let size = metadata.len();
+    if max_bytes.is_some_and(|max| size > max) {
+        bail!("content hashing source exceeds admitted byte limit");
+    }
+    #[cfg(test)]
+    hash_tests::after_metadata();
+    let (hash, bytes) = hash_reader_bounded(&file, size)?;
+    if bytes != size || file.metadata()?.len() != size {
+        bail!("source changed during content hashing");
+    }
+    Ok(hash)
+}
+/// The common actual-I/O boundary, including one sentinel byte to detect growth.
+/// The reader may be a file or already admitted stream; no overflow byte is hashed.
+pub(crate) fn hash_reader_bounded(reader: impl std::io::Read, limit: u64) -> Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let sentinel = limit
+        .checked_add(1)
+        .context("content hash limit is too large")?;
+    let mut reader = reader.take(sentinel);
     let mut hash = Sha256::new();
+    let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = reader.read(&mut buffer)?;
+        #[cfg(test)]
+        hash_tests::READ_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
         if count == 0 {
             break;
         }
+        total += count as u64;
+        if total > limit {
+            bail!("content hashing source exceeds admitted byte limit");
+        }
         hash.update(&buffer[..count]);
     }
-    Ok(hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok((
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        total,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) mod hash_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io::Write;
+    thread_local! {
+        pub(crate) static READ_BYTES: Cell<u64> = const { Cell::new(0) };
+        static AFTER_METADATA: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn after_metadata() {
+        let callback = AFTER_METADATA.with(|slot| slot.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+    #[test]
+    fn stable_hash_limits_empty_exact_and_unrestricted_large_inverse() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("input");
+        std::fs::write(&path, b"abc").unwrap();
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(file_sha256(&path).unwrap(), expected);
+        assert_eq!(file_sha256_limited(&path, 3).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("allowed-link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                file_sha256(&link).unwrap(),
+                expected,
+                "generic media symlinks retain existing semantics"
+            );
+        }
+        READ_BYTES.with(|n| n.set(0));
+        assert!(
+            file_sha256_limited(&path, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("admitted byte limit")
+        );
+        assert_eq!(
+            READ_BYTES.with(Cell::get),
+            0,
+            "oversize fd metadata precedes payload reads"
+        );
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(
+            file_sha256_limited(&path, 0).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        std::fs::write(&path, vec![42; 1024 * 1024]).unwrap();
+        assert!(file_sha256_limited(&path, 16).is_err());
+        READ_BYTES.with(|n| n.set(0));
+        let digest = file_sha256(&path).unwrap();
+        assert_eq!(
+            digest,
+            crate::generation::bytes_sha256(&vec![42; 1024 * 1024])
+        );
+        assert_eq!(
+            READ_BYTES.with(Cell::get),
+            1024 * 1024,
+            "default has no arbitrary small-media cap"
+        );
+    }
+    #[test]
+    fn actual_file_growth_and_shrink_after_metadata_are_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing");
+        for max in [None, Some(16)] {
+            std::fs::write(&path, b"abcdefgh").unwrap();
+            let changed = path.clone();
+            AFTER_METADATA.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(changed)
+                        .unwrap()
+                        .write_all(&vec![42; 2 * 1024 * 1024])
+                        .unwrap();
+                }))
+            });
+            READ_BYTES.with(|n| n.set(0));
+            let error = file_hash(&path, max).unwrap_err().to_string();
+            assert!(error.contains("admitted byte limit"), "{error}");
+            assert_eq!(
+                READ_BYTES.with(Cell::get),
+                9,
+                "only initial8 plus sentinel consumed"
+            );
+        }
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let changed = path.clone();
+        AFTER_METADATA.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(changed)
+                    .unwrap()
+                    .set_len(3)
+                    .unwrap();
+            }))
+        });
+        assert!(
+            file_sha256(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_fifo_rejects_without_waiting_for_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fifo");
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: owned scratch pathname, ordinary owner-only FIFO mode.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(
+            file_sha256(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("regular local file")
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+    #[test]
+    fn reader_growth_actual_sentinel_and_impossible_limit() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"small").unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 5);
+        file.write_all(&[42; 128]).unwrap();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).unwrap();
+        READ_BYTES.with(|n| n.set(0));
+        assert!(
+            hash_reader_bounded(file, 16)
+                .unwrap_err()
+                .to_string()
+                .contains("admitted byte limit")
+        );
+        assert_eq!(READ_BYTES.with(Cell::get), 17);
+        assert!(
+            hash_reader_bounded(&b""[..], u64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("limit is too large")
+        );
+    }
 }
