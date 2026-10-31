@@ -1,7 +1,7 @@
 //! Optional HTML/React composition projects. Original media are copied, never linked.
 use super::number;
 use crate::{
-    media,
+    captions, media,
     timeline::{MediaKind, ValidatedEdit},
 };
 use anyhow::{Context, Result, ensure};
@@ -66,20 +66,102 @@ pub(super) fn export(edit: &ValidatedEdit, target: &str, output: &Path) -> Resul
     } else {
         remotion(edit, staging.path(), &sources)?;
     }
+    for (index, track) in edit.captions.iter().enumerate() {
+        for format in ["srt", "vtt"] {
+            fs::write(
+                staging.path().join(format!("captions-{index}.{format}")),
+                captions::encode(&track.cues, format)?,
+            )?;
+        }
+    }
+    fs::write(
+        staging.path().join("chapters.ffmetadata"),
+        captions::chapter_metadata(&edit.chapters, edit.duration()),
+    )?;
+    fs::write(
+        staging.path().join("captions-chapters.json"),
+        serde_json::to_vec_pretty(&json!({"captions":edit.captions,"chapters":edit.chapters}))?,
+    )?;
     fs::write(
         staging.path().join("edit.validated.json"),
         serde_json::to_vec_pretty(edit)?,
     )?;
-    // Exclusive reservation prevents clobbering a destination created while the
-    // media were being copied. Only our fresh directory receives generated files.
-    fs::create_dir(output).context("reserving new project directory")?;
-    for entry in fs::read_dir(staging.path())? {
-        let entry = entry?;
-        fs::rename(entry.path(), output.join(entry.file_name()))?;
+    publish_project(staging.path(), output)?;
+    let mut warnings = edit.warnings.clone();
+    if !edit.captions.is_empty() || !edit.chapters.is_empty() {
+        warnings.push("Captions and chapters are preserved in sidecars. After rendering, run skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4 to apply soft tracks, explicit burn-in, and chapters.".into());
     }
     Ok(
-        json!({"target":target,"output":output,"duration_seconds":edit.duration(),"copied_media_bytes":total_bytes,"warnings":edit.warnings,"next_command":if target=="hyperframes" {"hyperframes check <project-directory>"}else{"npm install && npm run render (inside project directory)"}}),
+        json!({"target":target,"output":output,"duration_seconds":edit.duration(),"copied_media_bytes":total_bytes,"warnings":warnings,"next_command":if target=="hyperframes" {"hyperframes check <project-directory>"}else{"npm install && npm run render (inside project directory)"}}),
     )
+}
+
+/// Publish the completed tree with exclusive directory renaming where available.
+/// Other platforms retain exclusive reservation with rollback on failed moves.
+fn publish_project(staging: &Path, output: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let source = CString::new(staging.as_os_str().as_bytes())?;
+        let destination = CString::new(output.as_os_str().as_bytes())?;
+        // NOREPLACE also protects an empty directory created during compilation.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        ) {
+            return Err(error).context("publishing complete project directory");
+        }
+    }
+    publish_reserved(staging, output)
+}
+
+fn publish_reserved(staging: &Path, output: &Path) -> Result<()> {
+    fs::create_dir(output).context("reserving new project directory")?;
+    let mut moved = Vec::new();
+    let result = (|| -> Result<()> {
+        for entry in fs::read_dir(staging)? {
+            let entry = entry?;
+            let destination = output.join(entry.file_name());
+            fs::rename(entry.path(), &destination)?;
+            moved.push(destination);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Restore only our entries and remove only an empty reservation. Never
+        // recursively remove content another caller might have added.
+        let mut failures = Vec::new();
+        for destination in moved.into_iter().rev() {
+            let source = staging.join(destination.file_name().expect("generated entry name"));
+            if let Err(rollback) = fs::rename(&destination, &source) {
+                failures.push(format!("{}: {rollback}", destination.display()));
+            }
+        }
+        if let Err(rollback) = fs::remove_dir(output) {
+            failures.push(format!("{}: {rollback}", output.display()));
+        }
+        if !failures.is_empty() {
+            return Err(error).context(format!(
+                "project publication rollback needs recovery: {}",
+                failures.join("; ")
+            ));
+        }
+        return Err(error).context("publishing project directory; reservation rolled back");
+    }
+    Ok(())
 }
 
 fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>) -> Result<()> {
@@ -154,7 +236,7 @@ fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, Stri
     )?;
     fs::write(
         dir.join("README.md"),
-        "Generated by Skywrite. Uses your installed Hyperframes CLI.\n\nRun `hyperframes lint .`, `hyperframes check .`, and `hyperframes render . -o edit.mp4`.\n\nAssets are copies. Timing, source trims, playback rates, and linear gains come from the validated edit. The pinned GSAP script may require network access unless your Hyperframes installation provides its vendor cache.\n",
+        "Generated by Skywrite. Uses your installed Hyperframes CLI.\n\nRun `hyperframes lint .`, `hyperframes check .`, and `hyperframes render . -o edit.mp4`.\n\nAssets are copies. Timing, source trims, playback rates, and linear gains come from the validated edit. Captions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`. The pinned GSAP script may require network access unless your Hyperframes installation provides its vendor cache.\n",
     )?;
     Ok(())
 }
@@ -202,7 +284,35 @@ registerRoot(Root);
     )?;
     fs::write(
         dir.join("README.md"),
-        "Generated by Skywrite. Assets are copies. Install the pinned optional runtime with `npm install`, then run `npm run studio` or `npm run render`.\n\nRemotion's license applies to its runtime; see https://www.remotion.dev/license. Source trims are rounded to composition-frame boundaries. This exporter accepts integer FPS; use FCPXML or FFmpeg for NTSC rates.\n",
+        "Generated by Skywrite. Assets are copies. Install the pinned optional runtime with `npm install`, then run `npm run studio` or `npm run render`.\n\nCaptions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`.\n\nRemotion's license applies to its runtime; see https://www.remotion.dev/license. Source trims are rounded to composition-frame boundaries. This exporter accepts integer FPS; use FCPXML or FFmpeg for NTSC rates.\n",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_publication_preserves_existing_directories_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for publish in [publish_project, publish_reserved] {
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            fs::write(staging.path().join("complete.json"), b"complete").unwrap();
+            let output = dir.path().join("project");
+            fs::create_dir(&output).unwrap();
+            fs::write(output.join("owned.txt"), b"previous").unwrap();
+            assert!(publish(staging.path(), &output).is_err());
+            assert_eq!(fs::read(output.join("owned.txt")).unwrap(), b"previous");
+            assert!(staging.path().join("complete.json").is_file());
+            fs::remove_file(output.join("owned.txt")).unwrap();
+            fs::remove_dir(&output).unwrap();
+            publish(staging.path(), &output).unwrap();
+            assert_eq!(fs::read(output.join("complete.json")).unwrap(), b"complete");
+            fs::remove_dir_all(output).unwrap();
+        }
+        let output = dir.path().join("failed");
+        assert!(publish_reserved(&dir.path().join("missing-staging"), &output).is_err());
+        assert!(!output.exists(), "failed reservation must be removed");
+    }
 }

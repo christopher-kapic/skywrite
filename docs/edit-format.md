@@ -105,3 +105,57 @@ output, even dimensions from 2 to 8192 pixels, 1–240 FPS, speed 0.125–8, and
 linear gain 0–4. Additional audio must fit within the primary timeline. Missing
 files, absent media streams, and source ranges exceeding the known duration
 are errors.
+
+## Optional captions and chapters
+
+Existing version 1 edits need no new fields. Add `captions` and `chapters` when
+needed; both use the **output timeline**, after cuts and retiming:
+
+```json
+{
+  "clips": [{"duration": 10}],
+  "captions": [{"source": "captions.srt", "language": "eng"}],
+  "chapters": [{"start": 0, "title": "Opening"}, {"start": 5, "title": "Next"}]
+}
+```
+
+Caption paths resolve relative to the edit and accept UTF-8 `.srt`, plain `.vtt`,
+or existing Skywrite transcript `.json` with real word timestamps. No ASR runs.
+The track mapping is `output_time = offset + scale * caption_time`; `offset`
+defaults to 0 and `scale` to 1. This is explicit mapping, not automatic caption
+reassembly across source cuts. Prepare separate output-timeline cues when cutting
+spoken source material. `language` is a three-letter lowercase ISO-639 code,
+default `und`. `mode` defaults to `soft`, producing optional MP4 `mov_text`
+subtitle tracks. Set `mode` to `burn` explicitly to render text into pixels;
+this requires FFmpeg's `subtitles` filter with libass. Caption text is plain text;
+markup is escaped and rendered literally through an internal WebVTT sidecar.
+Braces and backslashes in caption text are rejected before export/rendering,
+because FFmpeg cannot preserve them identically across soft tracks and burn-in.
+Unicode, quotes, and ordinary newlines remain supported; chapter titles do not
+have this subtitle-specific restriction. Plain SRT/VTT excludes styling, cue settings, and WebVTT regions.
+
+Chapter starts must increase strictly and fall inside the output duration; each
+chapter ends at the next start or the output end. Caption cues need ordered,
+positive timestamps fitting the timeline. Times must remain distinct at
+millisecond precision. Limits: 8 tracks, 100,000 total cues, 4 MiB text per track,
+4096 bytes per cue, 8 MiB per caption input, 1000 chapters, 512 bytes per chapter
+title; chapter/caption text excludes control characters. Remapping scales range
+from 0.125 to 8; offsets are limited to ±24 hours. Original edit, caption,
+transcript, and source media inputs are protected even with `--overwrite`.
+
+FFmpeg native rendering and generated Python scripts apply captions and chapters.
+FCPXML preserves caption data as plain JSON in the assembly note and emits chapter
+markers, with a warning that captions require separate import. Final Cut import
+has not been tested. Hyperframes and Remotion preserve SRT/VTT, chapter metadata,
+and JSON sidecars; their generated compositions do not apply them automatically.
+The FFmetadata sidecar contains chapter boundaries; JSON preserves exact titles,
+including trailing backslashes that FFmetadata cannot round-trip reliably.
+After rendering either optional backend, run:
+
+```sh
+skywrite captions mux rendered.mp4 --edit edit.json --output finished.mp4
+```
+
+This finishes a video matching the edit duration, copies its audio/video when
+possible, adds soft tracks/chapters, and re-encodes video for explicit burn-in.
+The original renderer output remains an input and cannot be replaced in place.

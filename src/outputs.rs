@@ -48,6 +48,12 @@ pub enum OutputsCommand {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Resolve a named output's public browser URL; optionally check an anonymous prefix.
+    Url {
+        name: String,
+        #[arg(long)]
+        check: bool,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -544,7 +550,7 @@ pub fn execute(command: OutputsCommand) -> Result<Value> {
             let plan = prepare(&file, name.as_deref(), &config.outputs_prefix)?;
             if dry_run {
                 return Ok(
-                    json!({"dry_run":true,"output":plan.record,"cloud_calls":false,"remote_check_performed":false}),
+                    json!({"dry_run":true,"output":plan.record,"public_url":config.output_public_url(&plan.record.blob_key)?,"public_access_verified":false,"cloud_calls":false,"remote_check_performed":false}),
                 );
             }
             let _lock = crate::storage::operation_lock()?;
@@ -553,12 +559,19 @@ pub fn execute(command: OutputsCommand) -> Result<Value> {
                 "storage configuration changed; retry output upload"
             );
             let cloud = crate::storage::Cloud::new(&config)?;
-            cloud.run(upload(
+            let mut result = cloud.run(upload(
                 &cloud.store,
                 &config.outputs_prefix,
                 &plan,
                 overwrite,
-            ))
+            ))?;
+            let key = result["output"]["blob_key"]
+                .as_str()
+                .context("upload result lacks blob key")?;
+            let public_url = config.output_public_url(key)?;
+            result["public_url"] = json!(public_url);
+            result["public_access_verified"] = json!(false);
+            Ok(result)
         }
         OutputsCommand::List { limit, after } => {
             ensure!(
@@ -596,7 +609,66 @@ pub fn execute(command: OutputsCommand) -> Result<Value> {
                 overwrite,
             ))
         }
+        OutputsCommand::Url { name, check } => {
+            name_check(&name)?;
+            let cloud = crate::storage::Cloud::new(&config)?;
+            let (record, prefix) = cloud.run(async {
+                let (record, _) = read_record(&cloud.store, &config.outputs_prefix, &name)
+                    .await?
+                    .context("named output not found")?;
+                let prefix = if check {
+                    Some(signed_prefix(&cloud.store, &record).await?)
+                } else {
+                    None
+                };
+                Ok((record, prefix))
+            })?;
+            let public_url = config.output_public_url(&record.blob_key)?;
+            let mut result = json!({"output":record,"public_url":public_url,"public_access_verified":false,
+                "signed_storage_read":true,"public_check_performed":check});
+            if let Some(prefix) = prefix {
+                let report =
+                    crate::public_access::check(&public_url, Some(&prefix), Some(record.bytes))?;
+                let success = report.anonymous_read_succeeded;
+                result["public_access_verified"] = json!(success);
+                result["public_access"] = serde_json::to_value(report)?;
+                return crate::public_access::checked_result(result, success);
+            }
+            Ok(result)
+        }
     }
+}
+
+async fn signed_prefix(store: &dyn ObjectStore, record: &OutputRecord) -> Result<Vec<u8>> {
+    let end = record.bytes.min(crate::public_access::PREFIX_BYTES as u64);
+    if end == 0 {
+        return Ok(Vec::new());
+    }
+    let result = store
+        .get_opts(
+            &object_store::path::Path::from(record.blob_key.clone()),
+            GetOptions::new().with_range(Some(0..end)),
+        )
+        .await?;
+    ensure!(
+        result.meta.size == record.bytes && result.range == (0..end),
+        "storage did not return the requested output prefix"
+    );
+    let mut stream = result.into_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= end as usize,
+            "signed output prefix exceeds requested bytes"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    ensure!(
+        bytes.len() == end as usize,
+        "signed output prefix ended early"
+    );
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -634,6 +706,16 @@ mod tests {
         runtime().block_on(async {
             let a = upload(&store, PREFIX, &one, false).await.unwrap();
             assert_eq!(a["uploaded"], true);
+            assert_eq!(
+                signed_prefix(&store, &one.record).await.unwrap(),
+                b"example output bytes"
+            );
+            let mut unknown = serde_json::to_value(&one.record).unwrap();
+            unknown["public_url"] = json!("https://example.com/untrusted");
+            assert!(
+                serde_json::from_value::<OutputRecord>(unknown).is_err(),
+                "URL wrapper must not relax strict v1 record parsing"
+            );
             assert_eq!(
                 upload(&store, PREFIX, &one, false).await.unwrap()["reused"],
                 true
@@ -794,12 +876,22 @@ mod tests {
         .unwrap();
         runtime().block_on(async {
             upload(&store, PREFIX, &empty, false).await.unwrap();
+            assert!(
+                signed_prefix(&store, &empty.record)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             let out = dir.path().join("empty-download");
             download(&store, PREFIX, "empty.txt", &out, false)
                 .await
                 .unwrap();
             assert_eq!(std::fs::metadata(out).unwrap().len(), 0);
             upload(&store, PREFIX, &big, false).await.unwrap();
+            assert_eq!(
+                signed_prefix(&store, &big.record).await.unwrap(),
+                data[..crate::public_access::PREFIX_BYTES]
+            );
             let out = dir.path().join("large-download");
             download(&store, PREFIX, "binary.dat", &out, false)
                 .await

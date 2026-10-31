@@ -21,3 +21,13 @@ pub mod storage;
 
 pub mod audio_generation;
 pub mod config_cli;
+
+pub mod public_access;
+pub mod timing;
+pub mod verify;
+
+pub mod project;
+
+pub mod audio;
+
+pub mod captions;

@@ -32,6 +32,7 @@ skywrite storage configure \
 
 skywrite storage status
 skywrite storage upload camera.mp4 --dry-run
+skywrite storage check-public 'skywrite/uploads/project-01/HASH.mp4'
 skywrite upscale video camera.mp4 --upload \
   --model black-forest-labs/flux-video-upscale --factor 2 \
   --delete-upload-after
@@ -47,6 +48,25 @@ container, profile or automatic credential discovery, and credentials are never
 saved. Non-secret settings are stored in `~/.skywrite/storage.json`
 (`SKYWRITE_HOME` overrides the personal directory). Changing settings does not
 move or delete existing uploads.
+
+`storage upload` returns a constructed `public_url` with
+`public_access_verified: false`; successful signed storage access does not prove
+anonymous public access. `storage check-public KEY` explicitly checks an existing
+upload hash key beneath the configured uploads prefix, without reading AWS
+credentials or contacting a model. It requests only bytes 0–1023 anonymously,
+using `skywrite/VERSION`, and reports HTTP status, type, range, bytes checked and
+whether the bounded anonymous read succeeded. It does not compare the bytes with
+signed storage or certify their full SHA-256. Use `outputs url NAME --check` for a
+signed-prefix comparison of a shared output.
+
+The diagnostic follows at most four redirects. Each hop uses the same public
+HTTPS, globally reachable IP, DNS pinning and TLS validation guard as public
+generation downloads. It sends no AWS headers, bearer tokens or cookies and
+disables proxies. Each request times out after 30 seconds and reads at most 1025
+bytes to detect responses exceeding 1024 bytes. A server ignoring Range succeeds
+only for a complete object no larger than that bound. Failed diagnostic results
+are JSON with a nonzero exit status; a private bucket's HTTP 403 remains distinct
+from signed-storage authorization and future provider fetch availability.
 
 `--upload` explicitly makes the video's bytes available through your public
 bucket. It conflicts with `--source-job` and `--source-url`.

@@ -53,6 +53,59 @@ impl Transcript {
         }
         Ok(())
     }
+    /// Original provider timestamps overlapping a source playback range. Crossing
+    /// words remain intact: clipping their times would invent alignment evidence.
+    pub fn words_in_range(&self, start: f64, end: f64, limit: usize) -> Result<Vec<&Word>> {
+        self.validate()?;
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+            bail!("word query needs a finite, positive source range");
+        }
+        let mut words = Vec::new();
+        for word in &self.words {
+            if word.start >= end {
+                break;
+            }
+            if word.end > start || word.start == start {
+                if words.len() == limit {
+                    bail!("word context exceeds {limit} words; analyze a shorter source range");
+                }
+                words.push(word);
+            }
+        }
+        Ok(words)
+    }
+
+    /// Bind external and embedded transcripts through the same identity boundary.
+    /// Fingerprints permit byte-identical relocated media; legacy files need the
+    /// original canonical path. A supplied fingerprint never falls back to path.
+    pub fn verify_source(&self, source: &Path, base: &Path, sha256: &str) -> Result<()> {
+        self.validate()?;
+        if let Some(expected) = self.usage.as_ref().and_then(|u| u.get("source_sha256")) {
+            let expected = expected
+                .as_str()
+                .context("invalid transcript source fingerprint")?;
+            if expected != sha256 {
+                bail!(
+                    "transcript source content has changed; transcribe the current media before analyzing"
+                );
+            }
+        } else {
+            let path = if self.source.is_absolute() {
+                self.source.clone()
+            } else {
+                base.join(&self.source)
+            };
+            if crate::media::canonical_file(&path).context("resolving transcript source")?
+                != crate::media::canonical_file(source)?
+            {
+                bail!(
+                    "transcript belongs to another media file; first remap timestamps explicitly using sync results"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let transcript: Self = crate::io::read_json(path)?;
         transcript.validate()?;
@@ -227,6 +280,10 @@ fn transcribe_with_limits(
     if !info.has_audio() {
         bail!("media has no audio stream");
     }
+    // Header estimates for malformed/VBR audio must not truncate transcription
+    // or offset later chunks. Video retains its presentation timeline.
+    let resolved = crate::media::resolve_audio_only_timing(info.clone())?;
+    let info = &resolved;
     let duration = options.duration.unwrap_or(info.duration - options.start);
     crate::media::validate_range(info, options.start, duration)?;
     if !(10.0..=120.0).contains(&options.chunk_seconds) {
@@ -736,6 +793,69 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("serialized output budget")
+        );
+    }
+}
+
+#[cfg(test)]
+mod word_window_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_speakers_point_words_and_context_limits_preserve_provider_data() {
+        let transcript: Transcript = serde_json::from_value(json!({
+            "source":"unused.wav","duration":4.0,"text":"a b point c",
+            "words":[
+                {"text":"a","start":0.8,"end":1.2},
+                {"text":"b","start":0.9,"end":1.3},
+                {"text":"point","start":1.0,"end":1.0},
+                {"text":"c","start":2.0,"end":2.2}
+            ]
+        }))
+        .unwrap();
+        let words = transcript.words_in_range(1.0, 2.0, 3).unwrap();
+        assert_eq!(
+            words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "point"]
+        );
+        assert_eq!(words[0].start, 0.8);
+        assert!(transcript.words_in_range(1.0, 2.0, 2).is_err());
+        assert!(transcript.words_in_range(1.4, 1.8, 0).unwrap().is_empty());
+        assert!(transcript.words_in_range(f64::NAN, 2.0, 3).is_err());
+    }
+
+    #[test]
+    fn identity_allows_hashed_copies_but_legacy_paths_and_malformed_hashes_stay_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.wav");
+        let copy = dir.path().join("copy.wav");
+        std::fs::write(&source, b"owned identity fixture").unwrap();
+        std::fs::copy(&source, &copy).unwrap();
+        let hash = crate::media::file_sha256(&source).unwrap();
+        let mut transcript: Transcript = serde_json::from_value(json!({
+            "source":"source.wav","duration":1.0,"text":"", "words":[],
+            "usage":{"source_sha256":hash}
+        }))
+        .unwrap();
+        transcript.verify_source(&copy, dir.path(), &hash).unwrap();
+        transcript.usage = None;
+        assert!(
+            transcript
+                .verify_source(&copy, dir.path(), &hash)
+                .unwrap_err()
+                .to_string()
+                .contains("another media file")
+        );
+        transcript
+            .verify_source(&source, dir.path(), &hash)
+            .unwrap();
+        transcript.usage = Some(json!({"source_sha256":null}));
+        assert!(
+            transcript
+                .verify_source(&source, dir.path(), &hash)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid transcript source fingerprint")
         );
     }
 }

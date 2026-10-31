@@ -19,3 +19,11 @@ skywrite upscale video --source-job JOB_ID --model UPSCALE_MODEL --factor 2
 ```
 
 Discover supported parameters first. H3 Max accepts only one keyframe per request. Inspect character consistency visually. Resume existing jobs rather than automatically retrying an uncertain paid submit. Source-job upscale uses fresh signed URLs with stable content identity.
+
+## Keep identity references separate from shot design
+
+A reference showing an entire garden can anchor the garden layout, framing, and camera position as strongly as it anchors the character. In the Pip production, repeatedly conditioning on the same full garden image encouraged a locked camera and similar compositions. Treat that as a planning lesson, not a guarantee about a provider's behavior.
+
+Use a character-focused identity reference when identity is the goal. Keep environment/layout references separate when the model supports multiple explicit roles; with only one supported image, choose the reference whose composition helps the intended shot and describe the remaining identity/environment constraints explicitly. A full scene reference is appropriate when layout continuity matters.
+
+Plan shot purpose, subject scale, camera angle, viewpoint, and camera movement before generating. Vary these deliberately across shots when the story calls for it: an establishing view, an insert of the story object, a character reaction, and a view from another position serve different purposes. Review an adjacent-shot contact sheet for repeated subject scale and framing before committing to an edit. Repeated framing can be intentional; a request does not guarantee motion or a particular composition. Retakes require explicit authorization and must never be submitted automatically to repair variety.

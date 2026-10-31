@@ -1,3 +1,6 @@
+pub use crate::timing::{
+    AudioTiming, exact_audio_timing, probe_for_timing, resolve_audio_only_timing,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,10 +218,15 @@ pub fn validate_range(info: &MediaInfo, start: f64, duration: f64) -> Result<()>
     if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 {
         bail!("start must be finite/nonnegative and duration finite/positive");
     }
-    if info.duration > 0.0 && start + duration > info.duration + 0.02 {
+    let source_duration = if info.has_audio() && !info.has_video() {
+        exact_audio_timing(info, None)?.presentation_end_seconds
+    } else {
+        info.duration
+    };
+    if source_duration > 0.0 && start + duration > source_duration + 0.02 {
         bail!(
             "requested range exceeds media duration ({}s)",
-            info.duration
+            source_duration
         );
     }
     Ok(())

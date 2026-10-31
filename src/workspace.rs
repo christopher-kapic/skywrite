@@ -63,6 +63,7 @@ pub enum ContentCommand {
 }
 
 const BUILTINS: &[(&str, &str)] = &[
+    ("projects", include_str!("../assets/skills/projects.md")),
     (
         "hyperframes",
         include_str!("../assets/skills/hyperframes.md"),

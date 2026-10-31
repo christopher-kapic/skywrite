@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "output_root": "generated",
+  "nodes": [
+    {
+      "id": "character",
+      "output": "character.png",
+      "action": { "type": "image", "prompt": "A consistent illustrated cloud character, plain background." }
+    },
+    {
+      "id": "opening",
+      "output": "opening.mp4",
+      "shot": { "size": "wide", "angle": "eye level", "motion": "gentle push in" },
+      "action": {
+        "type": "video",
+        "prompt": "The cloud character enters a sunlit garden.",
+        "first_frame": { "node": "character" },
+        "duration": 6
+      }
+    },
+    {
+      "id": "narration",
+      "output": "narration.mp3",
+      "action": { "type": "speech", "text": "Every small cloud has a story.", "voice": "af_heart" }
+    },
+    {
+      "id": "score",
+      "output": "score.mp3",
+      "action": { "type": "music", "prompt": "Gentle whimsical instrumental storybook score.", "instrumental": true }
+    }
+  ]
+}

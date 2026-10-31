@@ -54,6 +54,15 @@ fn output_discovery_cli_preflights_without_cloud_or_credentials() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["cloud_calls"], false);
     assert_eq!(value["output"]["name"], "diagram 🦊.json");
+    assert_eq!(value["public_access_verified"], false);
+    assert_eq!(
+        value["public_url"].as_str().unwrap(),
+        format!(
+            "https://cdn.example.invalid/{}",
+            value["output"]["blob_key"].as_str().unwrap()
+        )
+    );
+    assert!(value["output"].get("public_url").is_none());
     assert!(
         value["output"]["blob_key"]
             .as_str()
@@ -78,6 +87,8 @@ fn output_discovery_cli_preflights_without_cloud_or_credentials() {
     let destination = dir.path().join("keep.mp4");
     std::fs::write(&destination, b"keep").unwrap();
     for args in [
+        vec!["outputs", "url", "../escape"],
+        vec!["storage", "check-public", "../escape"],
         vec!["outputs", "list", "--limit", "0"],
         vec![
             "outputs",

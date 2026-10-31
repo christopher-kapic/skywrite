@@ -35,6 +35,8 @@ A music reference image can be supplied with `--reference image.png` when the se
 
 Music is received from streaming `/chat/completions`; each `delta.audio.data` base64 chunk is decoded separately, then joined in order. A complete stream terminator and nonempty audio are required. The provider may return MP3 even when a different format was requested, so Skywrite detects and fully decodes the actual container before declaring completion. Original MP3/WAV artifacts remain in the job folder. `.mp3`/`.wav` publication converts as necessary; it does not rename raw bytes. WAV publication uses 48-kHz stereo PCM16. Existing output replacement always requires `--overwrite`; input scripts and references remain protected.
 
+Use [`skywrite audio`](audio-finishing.md) for local two-pass loudness or peak normalization, pitch-preserving tempo, music loops with crossfades, narration-driven ducking, fades, trimming and exact silence padding. These steps reuse FFmpeg and make no paid requests. Reports include actual decoded final samples; generated MP3 metadata alone is not a reliable editing endpoint.
+
 `--instrumental`, tempo, key, structure and duration are creative requests, not verified promises. Listen to music for unwanted vocals, unsuitable dynamics, and the ending. The first tested clip measured about 27.3 seconds despite its nominal 30-second tier. These outputs are waveform files; editable MIDI-score tooling is deferred.
 
 ## Recovery and billing

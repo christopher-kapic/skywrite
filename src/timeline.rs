@@ -2,7 +2,10 @@
 //!
 //! All edit times are seconds measured from the first presented sample. `duration`
 //! is output duration, while `speed` is source seconds per output second.
-use crate::{io, media};
+use crate::{
+    captions::{self, CaptionTrack, Chapter, ValidatedTrack},
+    io, media,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -90,6 +93,10 @@ pub struct Edit {
     pub clips: Vec<Clip>,
     #[serde(default)]
     pub audio: Vec<AudioClip>,
+    #[serde(default)]
+    pub captions: Vec<CaptionTrack>,
+    #[serde(default)]
+    pub chapters: Vec<Chapter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +172,9 @@ pub struct ValidatedEdit {
     pub(crate) clips: Vec<ValidatedClip>,
     pub(crate) audio: Vec<ValidatedAudio>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) captions: Vec<ValidatedTrack>,
+    pub(crate) chapters: Vec<Chapter>,
+    pub(crate) inputs: Vec<PathBuf>,
 }
 impl ValidatedEdit {
     pub fn duration(&self) -> f64 {
@@ -173,7 +183,17 @@ impl ValidatedEdit {
     pub fn summary(&self) -> Value {
         json!({"version":1,"valid":true,"name":self.name,"width":self.width,"height":self.height,"fps":self.fps,
           "duration_seconds":self.duration(),"duration_frames":self.duration_frames,"clip_count":self.clips.len(),
-          "audio_clip_count":self.audio.len(),"warnings":self.warnings})
+          "audio_clip_count":self.audio.len(),"caption_track_count":self.captions.len(),"chapter_count":self.chapters.len(),"warnings":self.warnings})
+    }
+    pub fn protected_paths(&self) -> impl Iterator<Item = &Path> {
+        self.source_paths()
+            .chain(self.inputs.iter().map(PathBuf::as_path))
+            .chain(self.captions.iter().map(|c| c.source.as_path()))
+            .chain(
+                self.captions
+                    .iter()
+                    .flat_map(|c| c.inputs.iter().map(PathBuf::as_path)),
+            )
     }
     pub fn source_paths(&self) -> impl Iterator<Item = &Path> {
         self.clips
@@ -186,7 +206,9 @@ impl ValidatedEdit {
 pub fn load_and_validate(path: &Path) -> Result<ValidatedEdit> {
     let edit: Edit = io::read_json(path)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    validate(&edit, base)
+    let mut validated = validate(&edit, base)?;
+    validated.inputs.push(media::canonical_file(path)?);
+    Ok(validated)
 }
 
 pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
@@ -337,6 +359,8 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
             media: info,
         });
     }
+    let captions = captions::load_tracks(&edit.captions, base_dir, edit.fps.seconds(total))?;
+    captions::validate_chapters(&edit.chapters, edit.fps.seconds(total))?;
     Ok(ValidatedEdit {
         name: edit.name.clone(),
         width: edit.width,
@@ -346,6 +370,9 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
         clips,
         audio,
         warnings,
+        captions,
+        chapters: edit.chapters.clone(),
+        inputs: Vec::new(),
     })
 }
 
@@ -405,7 +432,7 @@ fn probe_cached(
     if let Some(info) = cache.get(path) {
         return Ok(info.clone());
     }
-    let info = media::probe(path)?;
+    let info = media::probe_for_timing(path)?;
     cache.insert(path.to_owned(), info.clone());
     Ok(info)
 }
@@ -455,6 +482,8 @@ mod tests {
                 volume: 1.0,
             }],
             audio: vec![],
+            captions: vec![],
+            chapters: vec![],
         }
     }
     #[test]

@@ -14,18 +14,21 @@ use std::time::{Duration, Instant};
 mod cancellation {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{Condvar, Mutex, OnceLock, atomic::AtomicI32};
 
     pub struct State {
         pub children: Mutex<HashMap<u32, bool>>,
         drained: Condvar,
-        pub cancelled: AtomicBool,
+        first_signal: AtomicI32,
     }
     static STATE: OnceLock<std::result::Result<Arc<State>, String>> = OnceLock::new();
 
     // signal-hook leaves its low-level handler installed after unregistering.
     // Restore previous dispositions if setup fails before a signal owner exists.
-    struct SignalSetup(Vec<(i32, libc::sigaction)>);
+    struct SignalSetup {
+        dispositions: Vec<(i32, libc::sigaction)>,
+        registrations: Vec<signal_hook::SigId>,
+    }
     impl SignalSetup {
         fn capture() -> std::io::Result<Self> {
             let mut saved = Vec::new();
@@ -37,12 +40,18 @@ mod cancellation {
                 }
                 saved.push((signal, action));
             }
-            Ok(Self(saved))
+            Ok(Self {
+                dispositions: saved,
+                registrations: Vec::new(),
+            })
         }
     }
     impl Drop for SignalSetup {
         fn drop(&mut self) {
-            for (signal, action) in &self.0 {
+            for registration in self.registrations.drain(..) {
+                signal_hook::low_level::unregister(registration);
+            }
+            for (signal, action) in &self.dispositions {
                 // SAFETY: restore the exact disposition captured before setup.
                 unsafe {
                     libc::sigaction(*signal, action, std::ptr::null_mut());
@@ -55,22 +64,42 @@ mod cancellation {
         STATE
             .get_or_init(|| {
                 let mut rollback = SignalSetup::capture().map_err(|e| e.to_string())?;
+                let state = Arc::new(State {
+                    children: Mutex::new(HashMap::new()),
+                    drained: Condvar::new(),
+                    first_signal: AtomicI32::new(0),
+                });
+                for signal in [libc::SIGINT, libc::SIGTERM] {
+                    let state = state.clone();
+                    // SAFETY: the handler only performs a lock-free atomic operation.
+                    // Register before iterator wakeups, which enumerate co-pending
+                    // signals by number rather than by their delivery order.
+                    let registration = unsafe {
+                        signal_hook::low_level::register(signal, move || {
+                            let _ = state.first_signal.compare_exchange(
+                                0,
+                                signal,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
+                        })
+                    }
+                    .map_err(|e| e.to_string())?;
+                    rollback.registrations.push(registration);
+                }
                 let mut signals = signal_hook::iterator::Signals::new([
                     signal_hook::consts::SIGINT,
                     signal_hook::consts::SIGTERM,
                 ])
                 .map_err(|e| e.to_string())?;
-                let state = Arc::new(State {
-                    children: Mutex::new(HashMap::new()),
-                    drained: Condvar::new(),
-                    cancelled: AtomicBool::new(false),
-                });
                 let owner = state.clone();
                 std::thread::Builder::new()
                     .name("child-signals".into())
                     .spawn(move || {
-                        if let Some(signal) = signals.forever().next() {
-                            owner.cancelled.store(true, Ordering::SeqCst);
+                        // A signal can arrive between installing the recording
+                        // handlers and the iterator. In that case no wakeup exists.
+                        if owner.cancelled() || signals.forever().next().is_some() {
+                            let signal = owner.first_signal.load(Ordering::SeqCst);
                             let mut children =
                                 owner.children.lock().unwrap_or_else(|e| e.into_inner());
                             for (pid, live) in children.iter() {
@@ -86,17 +115,45 @@ mod cancellation {
                                     .unwrap_or_else(|e| e.into_inner());
                             }
                             drop(children);
+                            #[cfg(test)]
+                            super::tests::hold_signal_exit();
                             // Restore normal signal exit even when the caller is blocked in HTTP.
                             let _ = signal_hook::low_level::emulate_default_handler(signal);
                         }
                     })
                     .map_err(|e| e.to_string())?;
-                rollback.0.clear();
+                rollback.dispositions.clear();
+                rollback.registrations.clear();
                 Ok(state)
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("installing child signal supervisor: {e}"))
     }
+    impl State {
+        pub fn cancelled(&self) -> bool {
+            self.first_signal.load(Ordering::SeqCst) != 0
+        }
+    }
+
+    // Drop after the child owner and registration lock on EVERY run() return,
+    // including spawn/read failures and unwind. Returning cancellation to main
+    // could otherwise race its ordinary error exit against the signal owner.
+    pub struct ReturnGuard(pub &'static Arc<State>);
+    impl Drop for ReturnGuard {
+        fn drop(&mut self) {
+            if self.0.cancelled() {
+                let mut children = self.0.children.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    children = self
+                        .0
+                        .drained
+                        .wait(children)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+    }
+
     pub fn kill_group(pid: u32) {
         // SAFETY: each registered child was spawned in its own process group.
         unsafe {
@@ -173,11 +230,13 @@ pub fn run(
     #[cfg(unix)]
     let state = cancellation::state()?;
     #[cfg(unix)]
+    let _return_guard = cancellation::ReturnGuard(state);
+    #[cfg(unix)]
     let mut registration = {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         let registration = state.children.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled.load(Ordering::SeqCst) {
+        if state.cancelled() {
             bail!("subprocess cancelled");
         }
         registration
@@ -241,7 +300,7 @@ pub fn run(
     let mut captured: [Option<Vec<u8>>; 2] = [None, None];
     loop {
         #[cfg(unix)]
-        if state.cancelled.load(Ordering::SeqCst) {
+        if state.cancelled() {
             bail!("{program} cancelled");
         }
         if exceeded.load(Ordering::Relaxed) {
@@ -313,6 +372,133 @@ pub fn args(values: &[&str]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only test binaries expose this scheduler gate. Production always proceeds
+    // directly from complete registry drain to default signal emulation.
+    #[cfg(unix)]
+    pub(super) fn hold_signal_exit() {
+        if let Some(dir) = std::env::var_os("SKYWRITE_SIGNAL_EXIT_GATE") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::write(dir.join("drained"), b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !dir.join("release").exists() {
+                assert!(Instant::now() < deadline, "signal exit gate timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_exit_fixture() {
+        let Some(dir) = std::env::var_os("SKYWRITE_SIGNAL_EXIT_GATE") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (tx, rx) = mpsc::channel();
+        for index in 0..3 {
+            let tx = tx.clone();
+            let marker = dir.join(index.to_string());
+            std::thread::spawn(move || {
+                let script = format!(
+                    "printf %s $$ > '{}'; exec /usr/bin/ffmpeg -nostdin -v error -re -f lavfi -i sine=frequency=440:sample_rate=48000 -t 30 -f s16le pipe:1",
+                    marker.display()
+                );
+                let result = run(
+                    "/bin/sh",
+                    &args(&["-c", &script]),
+                    Duration::from_secs(35),
+                    8 * 1024 * 1024,
+                );
+                let _ = tx.send(result.is_err());
+            });
+        }
+        // Reproduce a CLI main that returns an error immediately after its
+        // process runner returns, rather than masking the race with a sleep.
+        let _ = rx.recv().unwrap();
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_waits_for_signal_exit_after_all_real_ffmpeg_groups_drain() {
+        use std::os::unix::process::ExitStatusExt;
+        fn until(mut check: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while !check() {
+                assert!(Instant::now() < deadline, "cancellation fixture timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut parent = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::cancellation_exit_fixture",
+                    "--nocapture",
+                ])
+                .env("SKYWRITE_SIGNAL_EXIT_GATE", dir.path())
+                .spawn()
+                .unwrap();
+            until(|| {
+                (0..3).all(|i| {
+                    std::fs::read_to_string(dir.path().join(i.to_string()))
+                        .ok()
+                        .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+                        .is_some_and(|name| name.trim() == "ffmpeg")
+                })
+            });
+            let pids: Vec<String> = (0..3)
+                .map(|i| std::fs::read_to_string(dir.path().join(i.to_string())).unwrap())
+                .collect();
+            assert_eq!(unsafe { libc::kill(parent.id() as i32, signal) }, 0);
+            until(|| {
+                if let Some(status) = parent.try_wait().unwrap() {
+                    // A fault can let main exit before other owners clean up.
+                    // Bound the deliberate-fault experiment to its own groups.
+                    for pid in &pids {
+                        unsafe {
+                            libc::kill(pid.parse().unwrap(), libc::SIGKILL);
+                        }
+                    }
+                    assert_eq!(
+                        status.signal(),
+                        Some(signal),
+                        "run returned before all groups/readers drained"
+                    );
+                }
+                dir.path().join("drained").exists()
+            });
+            // Owner is paused after ALL child waits and reader joins. An old
+            // run() returns now and the fixture exits 1 before gate release.
+            assert!(
+                pids.iter()
+                    .all(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+            );
+            let other = if signal == libc::SIGTERM {
+                libc::SIGINT
+            } else {
+                libc::SIGTERM
+            };
+            assert_eq!(unsafe { libc::kill(parent.id() as i32, other) }, 0);
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline {
+                assert!(
+                    parent.try_wait().unwrap().is_none(),
+                    "run returned before default signal exit"
+                );
+                std::thread::yield_now();
+            }
+            std::fs::write(dir.path().join("release"), b"go").unwrap();
+            until(|| parent.try_wait().unwrap().is_some());
+            assert_eq!(
+                parent.wait().unwrap().signal(),
+                Some(signal),
+                "first actual signal must win"
+            );
+        }
+    }
+
     #[test]
     fn executable_missing_is_actionable() {
         assert!(

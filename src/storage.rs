@@ -55,6 +55,8 @@ pub enum StorageCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Anonymously check up to 1024 public bytes of an upload hash key; no model calls.
+    CheckPublic { key: String },
     /// Delete only marked Skywrite hash objects beneath the configured prefix.
     Purge {
         #[arg(long)]
@@ -201,10 +203,35 @@ impl StorageConfig {
             && self.prefix == other.prefix
     }
     pub fn public_url(&self, key: &str) -> Result<String> {
+        self.validate()?;
         ensure!(
             owned_hash(&self.prefix, key).is_some(),
             "object key is outside this Skywrite upload prefix"
         );
+        self.url_for_validated_key(key)
+    }
+    /// Construct a URL only for a canonical immutable output blob key.
+    pub(crate) fn output_public_url(&self, key: &str) -> Result<String> {
+        self.validate()?;
+        let suffix = key
+            .strip_prefix(&format!("{}blobs/", self.outputs_prefix))
+            .context("object key is outside this Skywrite outputs prefix")?;
+        let (hash, extension) = suffix.split_once('.').context("invalid output blob key")?;
+        ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && !extension.is_empty()
+                && extension.len() <= 12
+                && extension
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "invalid output blob key"
+        );
+        self.url_for_validated_key(key)
+    }
+    fn url_for_validated_key(&self, key: &str) -> Result<String> {
         let mut base = https_url(&self.public_base_url, false)?;
         {
             let mut segments = base
@@ -664,13 +691,24 @@ pub fn execute(command: StorageCommand) -> Result<Value> {
             let plan = plan_upload(&input)?;
             if dry_run {
                 return Ok(
-                    json!({"dry_run":true,"upload":plan.record,"public_url":plan.record.public_url()?,"cloud_calls":false}),
+                    json!({"dry_run":true,"upload":plan.record,"public_url":plan.record.public_url()?,"public_access_verified":false,"cloud_calls":false}),
                 );
             }
             let _lock = operation_lock()?;
             let uploaded = ensure_uploaded(&plan)?;
             Ok(
-                json!({"uploaded":uploaded,"reused":!uploaded,"upload":plan.record,"public_url":plan.record.public_url()?}),
+                json!({"uploaded":uploaded,"reused":!uploaded,"upload":plan.record,"public_url":plan.record.public_url()?,"public_access_verified":false}),
+            )
+        }
+        StorageCommand::CheckPublic { key } => {
+            let config = configuration()?;
+            let public_url = config.public_url(&key)?;
+            let report = crate::public_access::check(&public_url, None, None)?;
+            let success = report.anonymous_read_succeeded;
+            crate::public_access::checked_result(
+                json!({"key":key,"public_url":public_url,"signed_storage_read":false,
+                "public_access":report,"note":"Anonymous prefix diagnostic only; provider access and full-object integrity are unverified."}),
+                success,
             )
         }
         StorageCommand::Purge {
@@ -780,6 +818,33 @@ mod tests {
         assert!(c.validate().is_err());
         let unknown = json!({"version":1,"endpoint":"https://example.com","bucket":"test-bucket","region":"auto","public_base_url":"https://cdn.example.com","prefix":NAMESPACE,"secret_access_key":"NO_SECRET"});
         assert!(serde_json::from_value::<StorageConfig>(unknown).is_err());
+    }
+    #[test]
+    fn output_urls_bind_to_exact_namespace_hash_and_extension() {
+        let c = config();
+        let hash = "a".repeat(64);
+        assert_eq!(
+            c.output_public_url(&format!("{}blobs/{hash}.mp4", c.outputs_prefix))
+                .unwrap(),
+            format!("https://assets.example.com/media/skywrite/outputs/blobs/{hash}.mp4")
+        );
+        for key in [
+            format!("skywrite/outputs-extra/blobs/{hash}.mp4"),
+            format!("skywrite/outputs/blobs/{hash}.mp4/../../secret"),
+            format!("skywrite/outputs/blobs/{hash}.%2e%2e"),
+            format!("skywrite/outputs/blobs/{hash}.MP4"),
+            format!("skywrite/uploads/{hash}.mp4"),
+            format!("skywrite/outputs/blobs/{}.mp4", "A".repeat(64)),
+        ] {
+            assert!(c.output_public_url(&key).is_err(), "{key}");
+        }
+        let mut project = c.clone();
+        project.outputs_prefix = "skywrite/outputs/project/".into();
+        assert!(
+            project
+                .output_public_url(&format!("skywrite/outputs/blobs/{hash}.mp4"))
+                .is_err()
+        );
     }
     #[test]
     fn object_identity_survives_cdn_and_prefix_changes_but_not_bucket_changes() {

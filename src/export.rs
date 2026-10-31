@@ -1,5 +1,6 @@
 //! Deterministic output backends compiled from a validated edit.
 use crate::{
+    captions::{self, CaptionMode},
     io, media, process,
     timeline::{MediaKind, ValidatedEdit},
 };
@@ -27,18 +28,22 @@ pub fn export(edit: &ValidatedEdit, target: &str, output: &Path, overwrite: bool
             "unsupported export target {target}; choose fcpxml, ffmpeg, hyperframes, or remotion"
         ),
     }
+    let mut warnings = edit.warnings.clone();
+    if target == "fcpxml" && !edit.captions.is_empty() {
+        warnings.push("Caption cues are preserved as plain JSON in the assembly note; import caption tracks separately. FCPXML does not apply burn-in. Final Cut import has not been tested.".into());
+    }
     Ok(
-        json!({"target":target,"output":output,"duration_seconds":edit.duration(),"duration_frames":edit.duration_frames,"warnings":edit.warnings}),
+        json!({"target":target,"output":output,"duration_seconds":edit.duration(),"duration_frames":edit.duration_frames,"warnings":warnings}),
     )
 }
 fn prevent_source_overwrite(edit: &ValidatedEdit, path: &Path) -> Result<()> {
-    if let Ok(path) = path.canonicalize() {
-        ensure!(
-            !edit.source_paths().any(|source| source == path),
-            "output must not replace an original source media file"
-        );
-    }
-    Ok(())
+    io::protect_inputs(
+        path,
+        &edit
+            .protected_paths()
+            .map(Path::to_owned)
+            .collect::<Vec<_>>(),
+    )
 }
 #[derive(Debug, Serialize)]
 struct RenderPlan {
@@ -46,6 +51,7 @@ struct RenderPlan {
     sources: Vec<PathBuf>,
     duration_seconds: f64,
     timeout_seconds: u64,
+    sidecars: Vec<String>,
 }
 fn number(value: f64) -> String {
     format!("{value:.9}")
@@ -309,13 +315,14 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
         )?;
         filters.push(mix);
     }
+    let (sidecars, video) = caption_args(edit, &mut args, input, &mut filters, "vout")?;
     push(
         &mut args,
         &[
             "-filter_complex",
             &filters.join(";"),
             "-map",
-            "[vout]",
+            &format!("[{video}]"),
             "-map",
             "[aout]",
             "-c:v",
@@ -349,12 +356,244 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
     );
     Ok(RenderPlan {
         args,
-        sources: edit.source_paths().map(Path::to_owned).collect(),
+        sources: edit.protected_paths().map(Path::to_owned).collect(),
+        sidecars,
         duration_seconds: edit.duration(),
         timeout_seconds: (edit.duration() * 20.0 + 120.0)
             .ceil()
             .clamp(120.0, 86_400.0) as u64,
     })
+}
+
+// Sidecar text is inert data. Only generated placeholders enter FFmpeg filters.
+fn caption_args(
+    edit: &ValidatedEdit,
+    args: &mut Vec<String>,
+    mut input: usize,
+    filters: &mut Vec<String>,
+    initial_video: &str,
+) -> Result<(Vec<String>, String)> {
+    let mut sidecars = Vec::new();
+    let mut video = initial_video.to_owned();
+    let mut soft = Vec::new();
+    for track in &edit.captions {
+        let index = sidecars.len();
+        sidecars.push(captions::encode(&track.cues, "vtt")?);
+        let marker = format!("__SKYWRITE_SIDECAR_{index}__");
+        if track.mode == CaptionMode::Burn {
+            let next = format!("vcaption{index}");
+            filters.push(format!("[{video}]subtitles=filename={marker}[{next}]"));
+            video = next;
+        } else {
+            push(
+                args,
+                &[
+                    "-protocol_whitelist",
+                    "file,pipe",
+                    "-f",
+                    "webvtt",
+                    "-i",
+                    &marker,
+                ],
+            );
+            soft.push((input, track.language.clone()));
+            input += 1;
+        }
+    }
+    if !edit.chapters.is_empty() {
+        let index = sidecars.len();
+        sidecars.push(captions::chapter_metadata(&edit.chapters, edit.duration()));
+        push(
+            args,
+            &[
+                "-protocol_whitelist",
+                "file,pipe",
+                "-f",
+                "ffmetadata",
+                "-i",
+                &format!("__SKYWRITE_SIDECAR_{index}__"),
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                &input.to_string(),
+            ],
+        );
+        for (index, chapter) in edit.chapters.iter().enumerate() {
+            push(
+                args,
+                &[
+                    &format!("-metadata:c:{index}"),
+                    &format!("title={}", chapter.title),
+                ],
+            );
+        }
+    } else {
+        push(args, &["-map_chapters", "-1"]);
+    }
+    for (index, (input, language)) in soft.iter().enumerate() {
+        push(
+            args,
+            &[
+                "-map",
+                &format!("{input}:s:0"),
+                &format!("-metadata:s:s:{index}"),
+                &format!("language={language}"),
+            ],
+        );
+    }
+    if !soft.is_empty() {
+        push(args, &["-c:s", "mov_text"]);
+    }
+    Ok((sidecars, video))
+}
+fn private_sidecars(plan: &RenderPlan) -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("skywrite-captions-")
+        .tempdir()?;
+    for (index, text) in plan.sidecars.iter().enumerate() {
+        std::fs::write(dir.path().join(format!("caption-{index}.vtt")), text)?;
+    }
+    Ok(dir)
+}
+fn plan_args(plan: &RenderPlan, dir: &Path) -> Result<Vec<OsString>> {
+    let mut args = plan.args.clone();
+    for index in 0..plan.sidecars.len() {
+        let path = dir.join(format!("caption-{index}.vtt"));
+        let path = path
+            .to_str()
+            .context("caption temporary path must be UTF-8")?;
+        ensure!(
+            path.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)),
+            "caption temporary path must contain only ASCII letters, digits, /._-"
+        );
+        let marker = format!("__SKYWRITE_SIDECAR_{index}__");
+        for index in 0..args.len() {
+            if args[index] == marker || (index > 0 && args[index - 1] == "-filter_complex") {
+                args[index] = args[index].replace(&marker, path);
+            }
+        }
+    }
+    Ok(args.into_iter().map(OsString::from).collect())
+}
+/// Finish the output of an optional renderer with the same validated metadata.
+pub fn mux_captions(
+    input: &Path,
+    edit: &ValidatedEdit,
+    output: &Path,
+    overwrite: bool,
+) -> Result<Value> {
+    prevent_source_overwrite(edit, output)?;
+    io::protect_inputs(output, &[input.to_owned()])?;
+    ensure!(
+        overwrite || !output.exists(),
+        "output already exists; pass --overwrite"
+    );
+    let input = media::canonical_file(input)?;
+    let info = media::probe_for_timing(&input)?;
+    ensure!(
+        info.has_video() && (info.duration - edit.duration()).abs() < 0.1 + 1.0 / edit.fps.value(),
+        "mux input must be a video matching the validated output timeline duration"
+    );
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-filter_complex_threads".into(),
+        "1".into(),
+    ];
+    push(
+        &mut args,
+        &[
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+            input.to_str().context("input path must be UTF-8")?,
+        ],
+    );
+    let mut filters = Vec::new();
+    let (sidecars, video) = caption_args(edit, &mut args, 1, &mut filters, "0:v:0")?;
+    if filters.is_empty() {
+        push(&mut args, &["-map", "0:v:0", "-c:v", "copy"]);
+    } else {
+        push(
+            &mut args,
+            &[
+                "-filter_complex",
+                &filters.join(";"),
+                "-map",
+                &format!("[{video}]"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-threads",
+                "2",
+            ],
+        );
+    }
+    push(
+        &mut args,
+        &[
+            "-map",
+            "0:a?",
+            "-c:a",
+            "copy",
+            "-t",
+            &number(edit.duration()),
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            "__SKYWRITE_OUTPUT__",
+        ],
+    );
+    let plan = RenderPlan {
+        args,
+        sidecars,
+        sources: vec![input],
+        duration_seconds: edit.duration(),
+        timeout_seconds: (edit.duration() * 20.0 + 120.0)
+            .ceil()
+            .clamp(120.0, 86400.0) as u64,
+    };
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temp = tempfile::Builder::new()
+        .prefix(".skywrite-mux-")
+        .suffix(".mp4")
+        .tempfile_in(parent)?;
+    let sidecars = private_sidecars(&plan)?;
+    let mut args = plan_args(&plan, sidecars.path())?;
+    *args.last_mut().context("missing output")? = temp.path().as_os_str().to_owned();
+    process::run(
+        "ffmpeg",
+        &args,
+        Duration::from_secs(plan.timeout_seconds),
+        4 * 1024 * 1024,
+    )?;
+    let rendered = media::probe(temp.path())?;
+    ensure!(
+        rendered.has_video()
+            && (rendered.duration - edit.duration()).abs() < 0.1 + 1.0 / edit.fps.value(),
+        "mux output duration differs from timeline"
+    );
+    if overwrite {
+        temp.persist(output).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(output).map_err(|e| e.error)?;
+    }
+    Ok(
+        json!({"output":output,"container":"mp4","caption_track_count":edit.captions.len(),"chapter_count":edit.chapters.len(),"duration_seconds":rendered.duration}),
+    )
 }
 
 pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Value> {
@@ -377,7 +616,8 @@ pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Va
         .suffix(".mp4")
         .tempfile_in(parent)?;
     let plan = render_plan(edit)?;
-    let mut args: Vec<OsString> = plan.args.iter().map(OsString::from).collect();
+    let sidecars = private_sidecars(&plan)?;
+    let mut args = plan_args(&plan, sidecars.path())?;
     *args.last_mut().context("missing output argument")? = temp.path().as_os_str().to_owned();
     process::run(
         "ffmpeg",
@@ -500,8 +740,17 @@ def main():
     handlers = {{sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM)}}
     fd, temporary = tempfile.mkstemp(prefix='.skywrite-render-', suffix='.mp4', dir=output.parent)
     os.close(fd)
+    sidecars = tempfile.TemporaryDirectory(prefix='skywrite-captions-')
     try:
         args = PLAN['args'].copy()
+        for index, content in enumerate(PLAN['sidecars']):
+            path = Path(sidecars.name) / ('caption-%d.vtt' % index)
+            path.write_text(content, encoding='utf-8')
+            # Only generated ASCII paths enter the subtitle filter.
+            if not all(c.isascii() and (c.isalnum() or c in '/._-') for c in str(path)):
+                raise ValueError('caption temporary path must contain only ASCII letters, digits, /._-')
+            marker = '__SKYWRITE_SIDECAR_%d__' % index
+            args = [arg.replace(marker, str(path)) if arg == marker or (position > 0 and args[position-1] == '-filter_complex') else arg for position, arg in enumerate(args)]
         args[-1] = temporary
         run_ffmpeg(args)
         if CANCELLED is not None:
@@ -513,6 +762,7 @@ def main():
             os.unlink(temporary)
         print(json.dumps({{'output': str(output), 'duration_seconds': PLAN['duration_seconds']}}))
     finally:
+        sidecars.cleanup()
         if os.path.exists(temporary):
             os.unlink(temporary)
         for sig, handler in handlers.items():

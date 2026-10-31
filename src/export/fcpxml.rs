@@ -126,9 +126,19 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
     // External audio placement remains independent of a retimed first shot.
     writeln!(
         out,
-        "<gap name=\"Skywrite assembly\" offset=\"0s\" start=\"0s\" duration=\"{}\"><spine lane=\"1\" offset=\"0s\">",
+        "<gap name=\"Skywrite assembly\" offset=\"0s\" start=\"0s\" duration=\"{}\">",
         edit.fps.fcpxml(edit.duration_frames)
     )?;
+    if !edit.captions.is_empty() {
+        writeln!(
+            out,
+            "<note>{}</note>",
+            xml(&serde_json::to_string(
+                &serde_json::json!({"caption_tracks":edit.captions,"usage":"Caption cues preserved as plain data; import captions separately. Burn mode is not applied by FCPXML."})
+            )?)
+        )?;
+    }
+    writeln!(out, "<spine lane=\"1\" offset=\"0s\">")?;
     for clip in &edit.clips {
         let duration = edit.fps.fcpxml(clip.duration_frames);
         let offset = edit.fps.fcpxml(clip.offset_frames);
@@ -218,6 +228,15 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
             )?;
         }
         writeln!(out, "</asset-clip>")?;
+    }
+    for chapter in &edit.chapters {
+        writeln!(
+            out,
+            "<chapter-marker start=\"{}\" duration=\"{}\" value=\"{}\" posterOffset=\"0s\"/>",
+            seconds(chapter.start),
+            edit.fps.fcpxml(1),
+            xml(&chapter.title)
+        )?;
     }
     writeln!(
         out,

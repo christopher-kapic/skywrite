@@ -73,7 +73,7 @@ fn fft(values: &mut [Complex], inverse: bool) {
 }
 fn decode(path: &Path, options: &SyncOptions) -> Result<Vec<f64>> {
     let path = crate::media::canonical_file(path)?;
-    let info = crate::media::probe(&path)?;
+    let info = crate::media::probe_for_timing(&path)?;
     ensure!(info.has_audio(), "{} has no audio stream", path.display());
     // Preserve audio delay relative to container origin, including nonzero/negative PTS.
     let args: Vec<OsString> = [
@@ -418,8 +418,8 @@ pub fn align_audio(reference: &Path, asset: &Path, options: &SyncOptions) -> Res
         result.quality = "limited".into();
         result.warnings.push("only energy-envelope alignment succeeded; waveform validation did not establish sub-frame accuracy".into());
     }
-    let ri = crate::media::probe(&rp)?;
-    let ai = crate::media::probe(&ap)?;
+    let ri = crate::media::probe_for_timing(&rp)?;
+    let ai = crate::media::probe_for_timing(&ap)?;
     if ri.duration > options.max_audio_seconds || ai.duration > options.max_audio_seconds {
         result.warnings.push(format!("analyzed only the first {} seconds of each recording; mapping is evidenced only over the reported matched interval",options.max_audio_seconds));
     }

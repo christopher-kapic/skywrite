@@ -373,7 +373,7 @@ fn validate_generated_media(path: &Path, media_type: &str) -> Result<()> {
         if open_regular(path, false)?.metadata()?.len() > MAX_VIDEO {
             bail!("video result exceeds 512 MiB");
         }
-        let media = crate::media::probe(path)?;
+        let media = crate::media::probe_for_timing(path)?;
         if !media.has_video()
             || !media
                 .format_name
@@ -472,8 +472,36 @@ struct Transport {
     key: String,
     base: String,
 }
+#[cfg(test)]
+thread_local! { static TEST_TRANSPORT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_test_transport<T>(base: &str, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_TRANSPORT.with(|cell| {
+                *cell.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let old = TEST_TRANSPORT.with(|cell| cell.replace(Some(base.into())));
+    let _restore = Restore(old);
+    work()
+}
 impl Transport {
     fn new() -> Result<Self> {
+        #[cfg(test)]
+        if let Some(base) = TEST_TRANSPORT.with(|cell| cell.borrow().clone()) {
+            let parsed = url::Url::parse(&base)?;
+            if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+                bail!("test transport must be owned loopback HTTP");
+            }
+            return Ok(Self {
+                client: Self::client()?,
+                key: "owned-test-fixture".into(),
+                base,
+            });
+        }
         let key = std::env::var("OPENROUTER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -591,7 +619,7 @@ impl Transport {
         bail!("too many video content redirects")
     }
 }
-fn validate_public_url(url: &url::Url) -> Result<()> {
+pub(crate) fn validate_public_url(url: &url::Url) -> Result<()> {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -637,7 +665,7 @@ fn public_address(ip: std::net::IpAddr) -> bool {
         }
     }
 }
-fn public_download_client(url: &url::Url) -> Result<Client> {
+pub(crate) fn public_download_client(url: &url::Url) -> Result<Client> {
     use std::net::ToSocketAddrs;
     validate_public_url(url)?;
     let host = url.host().context("missing content host")?;
@@ -665,6 +693,14 @@ fn pinned_download_builder(
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .resolve_to_addrs(host, addresses)
+}
+
+#[cfg(test)]
+pub(crate) fn public_test_client(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> reqwest::blocking::ClientBuilder {
+    pinned_download_builder(host, addresses)
 }
 
 fn prompt_check(prompt: &str) -> Result<()> {
@@ -696,7 +732,7 @@ fn image_bytes(path: &Path) -> Result<(Vec<u8>, String)> {
     }
     Ok((bytes, mime.into()))
 }
-fn bytes_sha256(bytes: &[u8]) -> String {
+pub(crate) fn bytes_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
@@ -807,6 +843,24 @@ struct Prepared {
     references: Vec<Value>,
     common: Common,
     wait: u64,
+}
+thread_local! {
+    static EXPECTED_PROJECT_JOB: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+/// Bind a project's durable admission to the exact request assembled by adapters.
+/// Rechecking at submit closes input/model changes between planning and execution.
+pub(crate) fn execute_generate_planned(command: GenerateCommand, expected: &str) -> Result<Value> {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXPECTED_PROJECT_JOB.with(|cell| {
+                *cell.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let old = EXPECTED_PROJECT_JOB.with(|cell| cell.replace(Some(expected.into())));
+    let _restore = Restore(old);
+    execute_generate(command)
 }
 pub fn execute_generate(command: GenerateCommand) -> Result<Value> {
     let prepared = match command {
@@ -1072,6 +1126,16 @@ fn submit_with_upload(
         &serde_json::to_vec(&identity_body)?,
         common.take.as_deref().unwrap_or("").as_bytes(),
     ]);
+    EXPECTED_PROJECT_JOB.with(|cell| -> Result<()> {
+        if cell
+            .borrow()
+            .as_ref()
+            .is_some_and(|expected| expected != &id)
+        {
+            bail!("project planned identity changed before generation; no request submitted");
+        }
+        Ok(())
+    })?;
     let request = sanitized_request(&body);
     if common.dry_run {
         return Ok(
@@ -1365,6 +1429,55 @@ fn refresh_video(dir: &Path, job: &mut Job, transport: &Transport, wait: u64) ->
         );
     }
 }
+/// Persist every directory link, deepest first, including newly created parents.
+/// Call after creation/rename and before recording durable dependent state.
+pub(crate) fn sync_directory_chain(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    for ancestor in path.canonicalize()?.ancestors() {
+        File::open(ancestor)?.sync_all()?;
+    }
+    Ok(())
+}
+/// Recreate only a genuinely missing publication from an already completed,
+/// hash-verified local job. Compare converted bytes before publishing anything.
+pub(crate) fn restore_project_publication(id: &str, output: &Path, hash: &str) -> Result<()> {
+    let (dir, _lock) = locked_job(id)?;
+    let job = load_job(&dir)?;
+    if job.status != "completed" {
+        bail!("completed project publication lacks a completed local job");
+    }
+    let scratch = tempfile::tempdir()?;
+    let expected = scratch
+        .path()
+        .join(output.file_name().context("output has no filename")?);
+    publish(&dir, &job, &expected, false)?;
+    if crate::media::file_sha256(&expected)? != hash {
+        bail!("local job publication disagrees with completed project hash");
+    }
+    // publish uses kernel no-clobber even if a file appeared since absence check.
+    publish(&dir, &job, output, false)
+}
+/// Reconcile publication after a project crash without touching the existing output.
+/// Conversion can change bytes, so compare against the same publisher's result,
+/// rather than the provider artifact hash. The project lock precedes this job lock.
+pub(crate) fn verify_project_publication(id: &str, output: &Path) -> Result<Value> {
+    let (dir, _lock) = locked_job(id)?;
+    let job = load_job(&dir)?;
+    if job.status != "completed" {
+        bail!("existing output belongs to an unfinished job");
+    }
+    let scratch = tempfile::tempdir()?;
+    let expected = scratch
+        .path()
+        .join(output.file_name().context("output has no filename")?);
+    publish(&dir, &job, &expected, false)?;
+    if crate::media::file_sha256(output)? != crate::media::file_sha256(&expected)? {
+        bail!("existing output does not match recorded job publication");
+    }
+    File::open(output)?.sync_all()?;
+    sync_directory_chain(output.parent().unwrap_or(Path::new(".")))?;
+    public_job(&dir, &job)
+}
 fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> {
     validate_output(Some(output), &job.references, overwrite)?;
     let artifact = job
@@ -1427,6 +1540,7 @@ fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> 
     } else {
         temp.persist_noclobber(output).map_err(|e| e.error)?;
     }
+    sync_directory_chain(parent)?;
     Ok(())
 }
 /// Read atomic job snapshots while holding the storage lock; never take job locks here.
@@ -1979,6 +2093,7 @@ fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool)
     } else {
         temp.persist_noclobber(output).map_err(|e| e.error)?;
     }
+    sync_directory_chain(parent)?;
     Ok(())
 }
 impl Transport {

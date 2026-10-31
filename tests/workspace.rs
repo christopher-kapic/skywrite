@@ -177,6 +177,7 @@ fn store_child() {
                     "fcpxml",
                     "ffmpeg",
                     "hyperframes",
+                    "projects",
                     "remotion",
                     "synchronization",
                     "takumi",

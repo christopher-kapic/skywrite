@@ -1,0 +1,106 @@
+//! Offline edit-consumer proof using supplied provider protocol word times.
+use serde_json::{Value, json};
+use std::process::Command;
+
+#[test]
+fn cached_edit_request_uses_bounded_words_and_retains_subframe_dialogue_source_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("speech.wav");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.1*sin(2*PI*(317*t+2*t*t)):s=16000:d=4",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let source_before = std::fs::read(&source).unwrap();
+    let hash = skywrite::media::file_sha256(&source).unwrap();
+    let mut report: skywrite::analysis::Analysis = serde_json::from_value(json!({
+        "version":1,"media":skywrite::media::probe(&source).unwrap(),
+        "range":{"start":1.0,"duration":1.0},"frames":[],"coverage":{"visual":"sparse"},
+        "transcript":{"version":1,"source":source,"duration":4.0,"text":"DO NOT USE UNBOUNDED SUMMARY","usage":{"source_sha256":hash},
+        "words":[{"text":"outside","start":0.1,"end":0.2},{"text":"supplied-word","start":1.300123,"end":1.600456},{"text":"later","start":2.4,"end":2.7}]},
+        "understanding":null,"model":null,"usage":null,"cached":false,"source_sha256":hash
+    })).unwrap();
+    let transcript = report.transcript.take().unwrap();
+    let transcript_path = dir.path().join("words.json");
+    skywrite::io::write_json(&transcript_path, &transcript, false).unwrap();
+    let report_path = dir.path().join("analysis.json");
+    skywrite::io::write_json(&report_path, &report, false).unwrap();
+    let schema = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .arg("schema")
+        .output()
+        .unwrap();
+    assert!(schema.status.success());
+    let schema: Value = serde_json::from_slice(&schema.stdout).unwrap();
+    let mut reports = [report];
+    skywrite::analysis::attach_transcripts(&mut reports, &[transcript]).unwrap();
+    let context = skywrite::analysis::suggestion_context(&reports).unwrap();
+    let encoded = serde_json::to_string(&context).unwrap();
+    assert!(encoded.contains("1.300123"));
+    assert!(!encoded.contains("DO NOT USE UNBOUNDED SUMMARY"));
+    assert!(!encoded.contains("outside"));
+    let brief = "Preserve supplied word precision with separate dialogue audio";
+    let prompt = format!(
+        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Use verified transcript word spans to keep spoken words intact when selecting dialogue. Intentional B-roll and J/L cuts remain valid. Prefer complete thoughts and purposeful cuts. You can include black gaps with source:null and separate audio overlays. Return ONLY an edit JSON object conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Output duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize durations and offsets to the requested frame grid. No titles/effects/unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
+        schema["edit"], encoded
+    );
+    let request = json!({"model":"fixture/dialogue","messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2});
+    let key = skywrite::openrouter::cache_key(&[
+        b"https://openrouter.ai/api/v1",
+        b"chat/completions",
+        &serde_json::to_vec(&request).unwrap(),
+    ]);
+    let draft = json!({"version":1,"name":"Supplied word","width":64,"height":64,"fps":{"num":30,"den":1},"clips":[{"source":null,"duration":1.0}],"audio":[{"source":source,"source_in":1.300123,"duration":0.5,"offset":0.0,"speed":1.0,"volume":1.0}]});
+    let cache = dir.path().join("cache/responses");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(
+        cache.join(format!("{key}.json")),
+        serde_json::to_vec(
+            &json!({"choices":[{"message":{"content":serde_json::to_string(&draft).unwrap()}}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output_path = dir.path().join("edit.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .env_remove("OPENROUTER_API_KEY")
+        .env("SKYWRITE_HOME", dir.path().join("personal"))
+        .args(["edit", "suggest", "--analysis"])
+        .arg(&report_path)
+        .arg("--transcript")
+        .arg(&transcript_path)
+        .args([
+            "--brief",
+            brief,
+            "--model",
+            "fixture/dialogue",
+            "--cache-dir",
+        ])
+        .arg(dir.path().join("cache"))
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["audio"][0]["source_in"], 1.300123);
+    assert_eq!(result["audio"][0]["duration"], 0.5);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"cached\":true"));
+    assert_eq!(std::fs::read(&source).unwrap(), source_before);
+    let loaded = skywrite::timeline::load_and_validate(&output_path).unwrap();
+    assert_eq!(loaded.summary()["audio_clip_count"], 1);
+}

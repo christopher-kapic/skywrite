@@ -143,6 +143,8 @@ fn edit() -> Edit {
                 volume: 1.0,
             },
         ],
+        captions: vec![],
+        chapters: vec![],
         audio: vec![AudioClip {
             source: "voice.wav".into(),
             source_in: 0.1,

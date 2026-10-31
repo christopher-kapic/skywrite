@@ -53,8 +53,9 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
     let text = if let Some(path) = &args.file {
         let path = crate::media::canonical_file(path)?;
         let bytes = crate::generation::read_bounded_file(&path, 8192)?;
+        let hash = crate::generation::bytes_sha256(&bytes);
         let text = String::from_utf8(bytes).context("narration script must be UTF-8")?;
-        refs.push(json!({"path":path,"sha256":crate::media::file_sha256(&path)?,"kind":"narration-script"}));
+        refs.push(json!({"path":path,"sha256":hash,"kind":"narration-script"}));
         text
     } else {
         args.text.context("provide --text or --file")?
@@ -288,7 +289,8 @@ pub(crate) fn validate_audio(path: &Path, mime: &str) -> Result<()> {
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_AUDIO as u64 {
         bail!("generated audio must be a regular file up to 32 MiB");
     }
-    let info = crate::media::probe(path)?;
+    let info = crate::media::probe_for_timing(path)
+        .context("generated audio failed decode validation during timing probe")?;
     if !info.has_audio()
         || info.has_video()
         || !info.duration.is_finite()
@@ -435,6 +437,13 @@ mod tests {
         assert!(
             format!("{error:#}").contains("decode validation"),
             "{error:#}"
+        );
+        assert!(
+            error
+                .chain()
+                .skip(1)
+                .any(|cause| cause.to_string().contains("ffmpeg")),
+            "underlying decoder failure must be preserved: {error:#}"
         );
     }
 }

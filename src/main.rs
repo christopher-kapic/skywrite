@@ -25,9 +25,16 @@ enum Command {
     Inspect {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
+        /// Decode and cache exact first-audio timing instead of trusting metadata.
+        #[arg(long)]
+        exact_audio: bool,
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
         #[command(flatten)]
         output: OutputOptions,
     },
+    /// Verify local metadata, decoded counts, duration and audio levels.
+    Verify(skywrite::verify::VerifyArgs),
     /// Sample timestamped frames and optionally request structured model understanding.
     Analyze(AnalyzeArgs),
     /// Transcribe bounded audio chunks through OpenRouter with real word timestamps.
@@ -71,6 +78,22 @@ enum Command {
         #[command(subcommand)]
         command: skywrite::generation::JobsCommand,
     },
+    /// Convert word-timed transcripts or mux optional subtitle tracks.
+    Captions {
+        #[command(subcommand)]
+        command: CaptionsCommand,
+    },
+    /// Finish local audio with bounded normalization, tempo, looping and ducking.
+    Audio {
+        #[command(subcommand)]
+        command: skywrite::audio::AudioCommand,
+    },
+    /// Run or resume a bounded declarative generation project.
+    #[command(alias = "batch")]
+    Project {
+        #[command(subcommand)]
+        command: skywrite::project::ProjectCommand,
+    },
     /// Dedicated AI video upscaling or explicit non-AI local image resizing.
     Upscale {
         #[command(subcommand)]
@@ -92,6 +115,37 @@ enum Command {
     Image {
         #[command(subcommand)]
         command: ImageCommand,
+    },
+}
+#[derive(Subcommand)]
+enum CaptionsCommand {
+    Convert {
+        transcript: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_parser = ["srt", "vtt"])]
+        format: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        offset: f64,
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+        #[arg(long, default_value_t = 8)]
+        max_words: usize,
+        #[arg(long, default_value_t = 4.0)]
+        max_duration: f64,
+        #[arg(long, default_value_t = 80)]
+        max_chars: usize,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    Mux {
+        media: PathBuf,
+        #[arg(long)]
+        edit: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 #[derive(Args)]
@@ -213,6 +267,9 @@ enum EditCommand {
     Suggest {
         #[arg(long,required=true,num_args=1..)]
         analysis: Vec<PathBuf>,
+        /// Attach existing word timestamps without another transcription request.
+        #[arg(long)]
+        transcript: Vec<PathBuf>,
         #[arg(long)]
         brief: String,
         #[arg(long)]
@@ -325,6 +382,18 @@ fn main() {
             }
         }
         Err(error) => {
+            let report = error
+                .downcast_ref::<skywrite::verify::CheckFailed>()
+                .map(|e| &e.report)
+                .or_else(|| {
+                    error
+                        .downcast_ref::<skywrite::public_access::CheckFailed>()
+                        .map(|e| &e.report)
+                });
+            if let Some(report) = report {
+                let _ = writeln!(std::io::stdout(), "{}", report);
+                std::process::exit(1);
+            }
             let _ = writeln!(
                 std::io::stderr(),
                 "{}",
@@ -352,6 +421,50 @@ fn execute(command: Command) -> Result<Value> {
         Command::Init(args) => skywrite::config_cli::initialize(args),
         Command::Generate { command } => skywrite::generation::execute_generate(command),
         Command::Jobs { command } => skywrite::generation::execute_jobs(command),
+        Command::Project { command } => skywrite::project::execute(command),
+        Command::Audio { command } => skywrite::audio::execute(command),
+        Command::Captions { command } => match command {
+            CaptionsCommand::Convert {
+                transcript,
+                output,
+                format,
+                offset,
+                scale,
+                max_words,
+                max_duration,
+                max_chars,
+                overwrite,
+            } => {
+                let format = format
+                    .as_deref()
+                    .or_else(|| output.extension().and_then(|s| s.to_str()))
+                    .context("caption output requires .srt/.vtt extension or --format")?;
+                skywrite::captions::convert(
+                    &transcript,
+                    &output,
+                    format,
+                    &skywrite::captions::ConvertOptions {
+                        offset,
+                        scale,
+                        max_words,
+                        max_duration,
+                        max_chars,
+                    },
+                    overwrite,
+                )
+            }
+            CaptionsCommand::Mux {
+                media,
+                edit,
+                output,
+                overwrite,
+            } => skywrite::captions::mux(
+                &media,
+                &skywrite::timeline::load_and_validate(&edit)?,
+                &output,
+                overwrite,
+            ),
+        },
         Command::Upscale { command } => skywrite::generation::execute_upscale(command),
 
         Command::Doctor => {
@@ -374,18 +487,49 @@ fn execute(command: Command) -> Result<Value> {
                 json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":"2.19.0","available":true}}),
             )
         }
-        Command::Inspect { inputs, output } => {
+        Command::Verify(args) => skywrite::verify::execute(args),
+        Command::Inspect {
+            inputs,
+            exact_audio,
+            cache_dir,
+            output,
+        } => {
+            preflight_output(&output)?;
             protect_inputs(&output, &inputs)?;
             let media = inputs
                 .iter()
-                .map(|p| skywrite::media::probe(p))
+                .map(|p| -> Result<Value> {
+                    let mut info = skywrite::media::probe(p)?;
+                    let timing = if exact_audio && info.has_audio() {
+                        Some(skywrite::media::exact_audio_timing(
+                            &info,
+                            cache_dir.as_deref(),
+                        )?)
+                    } else {
+                        None
+                    };
+                    if !info.has_video()
+                        && let Some(timing) = &timing
+                    {
+                        info.duration = timing.presentation_end_seconds;
+                    }
+                    let basis = if timing.is_some() && !info.has_video() {
+                        "decoded_audio_presentation"
+                    } else {
+                        "metadata_estimate"
+                    };
+                    let mut value = serde_json::to_value(info)?;
+                    value["duration_basis"] = json!(basis);
+                    value["audio_timing"] = serde_json::to_value(timing)?;
+                    Ok(value)
+                })
                 .collect::<Result<Vec<_>>>()?;
             finish(json!({"version":1,"media":media}), &output)
         }
         Command::Transcribe(args) => {
             preflight_output(&args.output)?;
             protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
-            let info = skywrite::media::probe(&args.input)?;
+            let info = skywrite::media::probe_for_timing(&args.input)?;
             let model = skywrite::models::resolve_model("transcription", args.model.as_deref())?;
             let result = skywrite::transcript::transcribe(
                 &info,
@@ -406,7 +550,7 @@ fn execute(command: Command) -> Result<Value> {
                 .chain(args.transcript.iter().cloned())
                 .collect();
             protect_inputs(&args.output, &inputs)?;
-            let info = skywrite::media::probe(&args.input)?;
+            let info = skywrite::media::probe_for_timing(&args.input)?;
             let model = if args.local {
                 None
             } else {
@@ -514,11 +658,19 @@ fn execute(command: Command) -> Result<Value> {
             }
             EditCommand::Suggest {
                 analysis,
+                transcript,
                 brief,
                 model,
                 api: options,
                 output,
-            } => suggest(&analysis, &brief, model.as_deref(), &options, &output),
+            } => suggest(
+                &analysis,
+                &transcript,
+                &brief,
+                model.as_deref(),
+                &options,
+                &output,
+            ),
         },
         Command::Models { command } => match command {
             ModelCommand::List {
@@ -591,21 +743,30 @@ fn preflight_output(output: &OutputOptions) -> Result<()> {
 }
 fn suggest(
     analyses: &[PathBuf],
+    transcripts: &[PathBuf],
     brief: &str,
     model: Option<&str>,
     options: &ApiOptions,
     output: &OutputOptions,
 ) -> Result<Value> {
     preflight_output(output)?;
-    protect_inputs(output, analyses)?;
-    if analyses.len() > 32 || brief.len() > 16 * 1024 {
-        bail!("suggest supports at most 32 analyses and a 16-KiB brief");
+    let input_paths: Vec<_> = analyses.iter().chain(transcripts).cloned().collect();
+    protect_inputs(output, &input_paths)?;
+    if analyses.len() > 32 || transcripts.len() > 32 || brief.len() > 16 * 1024 {
+        bail!("suggest supports at most 32 analyses, 32 transcripts and a 16-KiB brief");
     }
+    let admitted = skywrite::io::read_files_bounded(&input_paths, 8 * 1024 * 1024)
+        .context("suggestion input admission (eight MiB combined)")?;
     let mut reports = Vec::new();
     let mut allowed = std::collections::HashSet::new();
     let mut dependencies = Vec::new();
-    for file in analyses {
-        let report: skywrite::analysis::Analysis = skywrite::io::read_json(file)?;
+    let allowed_captions = transcripts
+        .iter()
+        .map(|p| skywrite::media::canonical_file(p))
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    for (file, bytes) in analyses.iter().zip(&admitted) {
+        let report: skywrite::analysis::Analysis = serde_json::from_slice(bytes)
+            .with_context(|| format!("invalid analysis JSON in {}", file.display()))?;
         allowed.insert(skywrite::media::canonical_file(&report.media.path)?);
         dependencies.extend(
             report
@@ -618,29 +779,45 @@ fn suggest(
         }
         reports.push(report);
     }
+    let mut attached = Vec::new();
+    for (file, bytes) in transcripts.iter().zip(admitted.iter().skip(analyses.len())) {
+        let mut transcript: skywrite::transcript::Transcript = serde_json::from_slice(bytes)
+            .with_context(|| format!("invalid transcript JSON in {}", file.display()))?;
+        transcript.source = relative_input(file, &transcript.source);
+        dependencies.push(transcript.source.clone());
+        attached.push(transcript);
+    }
     protect_inputs(output, &allowed.iter().cloned().collect::<Vec<_>>())?;
     protect_inputs(output, &dependencies)?;
+    skywrite::analysis::attach_transcripts(&mut reports, &attached)?;
     let model = skywrite::models::resolve_model("editing", model)?;
-    let encoded = serde_json::to_vec(&reports)?;
+    let encoded = serde_json::to_vec(&skywrite::analysis::suggestion_context(&reports)?)?;
     if encoded.len() > 8 * 1024 * 1024 {
         bail!("combined analysis reports exceed eight MiB; select fewer sources/ranges");
     }
     let prompt = format!(
-        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Prefer complete thoughts and purposeful cuts. You can include black gaps with source:null and separate audio overlays. Return ONLY an edit JSON object conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Output duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize durations and offsets to the requested frame grid. No titles/effects/unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
+        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Use verified transcript word spans to keep spoken words intact when selecting dialogue. Intentional B-roll and J/L cuts remain valid. Prefer complete thoughts and purposeful cuts. You can include black gaps with source:null and separate audio overlays. Return ONLY an edit JSON object conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Output duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize durations and offsets to the requested frame grid. No titles/effects/unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
         schema()["edit"],
         String::from_utf8(encoded)?
     );
     let response=api(options)?.request("chat/completions",&json!({"model":model,"messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2}))?;
     let draft = skywrite::openrouter::assistant_json(&response.body)?;
-    for list in ["clips", "audio"] {
+    for list in ["clips", "audio", "captions"] {
         if let Some(clips) = draft[list].as_array() {
             for clip in clips {
                 if let Some(source) = clip["source"].as_str() {
                     let path = Path::new(source);
                     if !path.is_absolute()
-                        || !allowed.contains(&skywrite::media::canonical_file(path)?)
+                        || !(if list == "captions" {
+                            &allowed_captions
+                        } else {
+                            &allowed
+                        })
+                        .contains(&skywrite::media::canonical_file(path)?)
                     {
-                        bail!("suggested edit references a source outside the provided analyses");
+                        bail!(
+                            "suggested edit references a source outside the provided analyses/transcripts"
+                        );
                     }
                 }
             }
@@ -653,7 +830,7 @@ fn suggest(
         .context("model edit failed validation; no output written")?;
     eprintln!(
         "{}",
-        json!({"suggest_usage":response.body.get("usage"),"cached":response.cached,"validation":validated.summary()})
+        json!({"suggest_usage":response.body.get("usage"),"cached":response.cached,"validation":validated.summary(),"dialogue_cut_warnings":skywrite::analysis::dialogue_cut_warnings(&validated,&reports)?})
     );
     finish(serde_json::to_value(edit)?, output)
 }

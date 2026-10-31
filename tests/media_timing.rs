@@ -28,6 +28,8 @@ fn specification(source: &Path, source_in: f64, duration: f64) -> Edit {
             volume: 1.0,
         }],
         audio: vec![],
+        captions: vec![],
+        chapters: vec![],
     }
 }
 #[test]
