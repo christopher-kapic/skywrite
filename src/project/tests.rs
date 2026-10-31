@@ -13,10 +13,20 @@ struct Server {
     seen: Arc<Mutex<Vec<String>>>,
     done: Arc<Mutex<Vec<String>>>,
     max: Arc<AtomicUsize>,
+    slow_release: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+// Releasing while unwinding prevents the scope join from depending on a failed
+// test assertion. The server also has a bounded wait and a drop-time fallback.
+struct ReleaseSlow(Arc<AtomicBool>);
+impl Drop for ReleaseSlow {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        self.slow_release.store(true, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let result = h.join();
@@ -66,6 +76,8 @@ fn server(png: Vec<u8>, block_output: Option<PathBuf>) -> Server {
     let seen = Arc::new(Mutex::new(vec![]));
     let done = Arc::new(Mutex::new(vec![]));
     let max = Arc::new(AtomicUsize::new(0));
+    let slow_release = Arc::new(AtomicBool::new(false));
+    let held_slow = slow_release.clone();
     let (end, observed, finished, peak) = (stop.clone(), seen.clone(), done.clone(), max.clone());
     let handle = std::thread::spawn(move || {
         std::thread::scope(|scope| {
@@ -79,13 +91,14 @@ fn server(png: Vec<u8>, block_output: Option<PathBuf>) -> Server {
                         let peak = peak.clone();
                         let png = png.clone();
                         let block_output = block_output.clone();
+                        let slow_release = held_slow.clone();
                         scope.spawn(move||{
                 let body=request(&socket);let prompt=body["prompt"].as_str().unwrap().to_owned();let count=active.fetch_add(1,Ordering::SeqCst)+1;peak.fetch_max(count,Ordering::SeqCst);
                 let home=crate::workspace::personal_home().unwrap();
                 let intent=fs::read_dir(home.join("jobs")).unwrap().any(|e|{let p=e.unwrap().path().join("job.json");if !p.is_file(){return false;}let v:Value=crate::io::read_json(&p).unwrap();v["status"]=="submitting" && v["request"]["prompt"]==prompt});assert!(intent,"POST must have durable job intent");
                 let admitted=fs::read_dir(home.join("projects")).unwrap().any(|e|{let p=e.unwrap().path().join("state.json");if !p.is_file(){return false;}let v:Value=crate::io::read_json(&p).unwrap();v["nodes"].as_object().unwrap().values().any(|s|s["status"]=="running" && s["planned_id"].is_string())});assert!(admitted,"POST must have durable project admission");
                 observed.lock().unwrap().push(prompt.clone());
-                if prompt.contains("slow"){std::thread::sleep(Duration::from_millis(300));}else if prompt.contains("crash"){std::thread::sleep(Duration::from_millis(1200));}else{std::thread::sleep(Duration::from_millis(30));}
+                if prompt=="slow"{wait_for(|| slow_release.load(Ordering::SeqCst));}else if prompt.contains("slow"){std::thread::sleep(Duration::from_millis(300));}else if prompt.contains("crash"){std::thread::sleep(Duration::from_millis(1200));}else{std::thread::sleep(Duration::from_millis(30));}
                 if prompt=="output-block" {fs::create_dir_all(block_output.unwrap()).unwrap();}
                 let mime=if png.starts_with(&[0xff,0xd8,0xff]) {"image/jpeg"}else{"image/png"};
                 let (status,value)=if prompt=="fail" {("400 Bad Request",json!({"error":"owned fixture rejection"}))}else{("200 OK",json!({"data":[{"media_type":mime,"b64_json":STANDARD.encode(png)}]}))};
@@ -106,6 +119,7 @@ fn server(png: Vec<u8>, block_output: Option<PathBuf>) -> Server {
         seen,
         done,
         max,
+        slow_release,
         handle: Some(handle),
     }
 }
@@ -218,10 +232,15 @@ fn durable_http_scheduler_and_recovery() {
         vec![image_node("slow", "slow"), image_node("fast", "fast"), dep],
     );
     std::thread::scope(|scope| {
+        let release_slow = ReleaseSlow(s.slow_release.clone());
         let h = scope.spawn(|| run(args(&path, &cache), false, engine(&s)).unwrap());
         wait_for(|| s.seen.lock().unwrap().len() >= 2);
         let err = run(args(&path, &cache), false, engine(&s)).unwrap_err();
         assert!(err.to_string().contains("locked"));
+        // Keep a real HTTP response pending until both the independent fast
+        // node and its dependent complete, rather than assuming 300ms overlaps.
+        wait_for(|| s.done.lock().unwrap().iter().any(|p| p == "after-fast"));
+        drop(release_slow);
         let result = h.join().unwrap();
         assert_eq!(result["complete"], true, "{result}");
     });
