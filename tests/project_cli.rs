@@ -122,3 +122,44 @@ fn project_cli_rejects_invalid_graphs_and_preserves_existing_output() {
         assert!(!home.join("jobs").exists());
     }
 }
+
+#[test]
+fn project_cli_rejects_oversized_image_before_models_or_job_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let image = temp.path().join("reference.png");
+    std::fs::File::create(&image)
+        .unwrap()
+        .set_len(17 * 1024 * 1024)
+        .unwrap();
+    let manifest = temp.path().join("story.json");
+    std::fs::write(&manifest,serde_json::to_vec(&serde_json::json!({"version":1,"output_root":"out","nodes":[{"id":"one","output":"one.png","model":"fixture/image","action":{"type":"image","prompt":"owned sparse fixture","references":[{"file":"reference.png"}]}}]})).unwrap()).unwrap();
+    for args in [
+        vec!["project", "validate", manifest.to_str().unwrap()],
+        vec![
+            "project",
+            "validate",
+            manifest.to_str().unwrap(),
+            "--check-models",
+            "--offline",
+        ],
+        vec!["project", "run", manifest.to_str().unwrap(), "--offline"],
+    ] {
+        let result = cli(&home, &args);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("project image input exceeds 16 MiB"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            !home.join("jobs").exists(),
+            "size admission must precede any job"
+        );
+        assert!(
+            !home.join("projects").exists(),
+            "size admission must precede durable project admission"
+        );
+    }
+    assert_eq!(std::fs::metadata(image).unwrap().len(), 17 * 1024 * 1024);
+}

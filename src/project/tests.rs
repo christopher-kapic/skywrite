@@ -667,3 +667,119 @@ fn structural_contract_and_boundaries() {
         assert!(load(&p).is_err());
     }
 }
+
+fn resource_manifest(root: &Path, references: Vec<Value>) -> PathBuf {
+    let manifest = root.join("resource.json");
+    let nodes: Vec<_> = references.chunks(10).enumerate().map(|(i, refs)| {
+        json!({"id":format!("r{i}"),"output":format!("r{i}.png"),"model":"fixture/image","action":{"type":"image","prompt":"owned resource fixture","references":refs}})
+    }).collect();
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&json!({"version":1,"output_root":"out","nodes":nodes})).unwrap(),
+    )
+    .unwrap();
+    manifest
+}
+#[test]
+fn project_image_hash_admission_deduplicates_real_reads_and_rejects_oversize() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("images")).unwrap();
+    let image = temp.path().join("images/reference.png");
+    fs::write(&image, b"owned image content").unwrap();
+    let refs = (0..20)
+        .map(|i| json!({"file":if i%2==0 {"images/reference.png"}else{"images//reference.png"}}))
+        .collect();
+    let manifest = resource_manifest(temp.path(), refs);
+    let loaded = load(&manifest).unwrap();
+    INPUT_HASH_BYTES.with(|bytes| bytes.set(0));
+    let identity = inputs(&loaded).unwrap();
+    assert_eq!(
+        INPUT_HASH_BYTES.with(|bytes| bytes.get()),
+        19,
+        "repeated resolved reference payload must be read only once per sweep"
+    );
+    assert_eq!(identity.len(), 1);
+    assert_eq!(
+        identity.values().next().unwrap(),
+        &crate::generation::bytes_sha256(b"owned image content")
+    );
+    File::create(&image)
+        .unwrap()
+        .set_len(INPUT_IMAGE_LIMIT + 1)
+        .unwrap();
+    INPUT_HASH_BYTES.with(|bytes| bytes.set(0));
+    let error = inputs(&loaded).unwrap_err().to_string();
+    assert!(error.contains("exceeds 16 MiB"), "{error}");
+    assert_eq!(
+        INPUT_HASH_BYTES.with(|bytes| bytes.get()),
+        0,
+        "oversized metadata rejects before a payload read"
+    );
+    assert!(
+        load(&manifest)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceeds 16 MiB")
+    );
+}
+#[test]
+fn project_image_aggregate_metadata_admission_precedes_all_payload_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let refs = (0..17)
+        .map(|i| {
+            let name = format!("reference{i}.png");
+            File::create(temp.path().join(&name))
+                .unwrap()
+                .set_len(INPUT_IMAGE_LIMIT)
+                .unwrap();
+            json!({"file":name})
+        })
+        .collect();
+    let manifest = resource_manifest(temp.path(), refs);
+    INPUT_HASH_BYTES.with(|bytes| bytes.set(0));
+    let error = load(&manifest).err().unwrap().to_string();
+    assert!(
+        error.contains("unique project image inputs exceed 256 MiB"),
+        "{error}"
+    );
+    assert_eq!(INPUT_HASH_BYTES.with(|bytes| bytes.get()), 0);
+    let mut value: Value = crate::io::read_json(&manifest).unwrap();
+    value["nodes"][1]["action"]["references"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let admitted = load(&manifest).unwrap();
+    assert_eq!(
+        input_inventory(&admitted).unwrap().len(),
+        16,
+        "exact aggregate and per-image boundaries remain valid metadata"
+    );
+}
+#[test]
+fn project_hash_actual_bytes_bound_even_after_real_file_grows() {
+    use std::io::{Seek, SeekFrom};
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"small").unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 5);
+    file.write_all(&[b'x'; 128]).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    INPUT_HASH_BYTES.with(|bytes| bytes.set(0));
+    let error = input_digest(file, 16).unwrap_err().to_string();
+    assert!(error.contains("exceeds admitted byte limit"));
+    assert_eq!(
+        INPUT_HASH_BYTES.with(|bytes| bytes.get()),
+        17,
+        "growth consumes only the bounded sentinel, not the remaining file"
+    );
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(INPUT_IMAGE_LIMIT).unwrap();
+    INPUT_HASH_BYTES.with(|bytes| bytes.set(0));
+    let (_, length) = input_digest(file, INPUT_IMAGE_LIMIT).unwrap();
+    assert_eq!(length, INPUT_IMAGE_LIMIT, "exact per-image bound succeeds");
+    assert_eq!(
+        INPUT_HASH_BYTES.with(|bytes| bytes.get()),
+        INPUT_IMAGE_LIMIT
+    );
+}

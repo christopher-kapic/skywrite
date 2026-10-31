@@ -35,6 +35,18 @@ A file reference is `{"file":"assets/character.png"}`. A generated reference is
 Explicit `depends_on` edges express ordering without consuming the output.
 Cycles, unknown nodes and local input/output aliases fail validation.
 
+Local file references are images: each is limited to 16 MiB, with at most 256 MiB
+across unique resolved paths. Structural validation checks these sizes before
+reading image payloads. Each content-identity sweep hashes a resolved file once,
+even when many nodes reference it; state retains the original relative path keys.
+Actual hash reads also enforce the limits if a file grows after metadata checks.
+The whole-project identity is rechecked before each first node admission, so a
+256-node invocation performs at most 258 sweeps (initial state, existing-state
+validation, and admissions), each bounded to 256 MiB plus one overflow sentinel
+byte per attempted sweep. This is an I/O bound, not a monetary spending policy.
+Generation's separate image decoding, pixel and combined-reference limits still
+apply, including to image outputs used by dependent nodes.
+
 Image actions accept `prompt`, `references`, `resolution`, `aspect_ratio`, `seed`.
 Video actions accept those fields plus `first_frame`, `last_frame`, `duration`,
 `audio`; frame inputs cannot be combined with general references. Speech accepts

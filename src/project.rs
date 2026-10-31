@@ -12,6 +12,11 @@ use std::sync::mpsc;
 
 const LIMIT: usize = 1024 * 1024;
 const MAX_NODES: usize = 256;
+// Match generation::image_bytes; project file references are images, never media videos.
+const INPUT_IMAGE_LIMIT: u64 = 16 * 1024 * 1024;
+const INPUT_TOTAL_LIMIT: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+thread_local! { static INPUT_HASH_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 #[derive(Debug, Args)]
 pub struct RunArgs {
     pub manifest: PathBuf,
@@ -430,6 +435,7 @@ fn validate(l: &Loaded) -> Result<()> {
             bail!("project dependencies contain a cycle");
         }
     }
+    input_inventory(l)?;
     Ok(())
 }
 fn warnings(l: &Loaded) -> Vec<String> {
@@ -447,17 +453,91 @@ fn warnings(l: &Loaded) -> Vec<String> {
     }
     out
 }
-fn inputs(l: &Loaded) -> Result<BTreeMap<PathBuf, String>> {
-    let mut out = BTreeMap::new();
+// Metadata admission and canonical deduplication precede ANY input payload reads.
+// Keep logical manifest keys in state; only the expensive content read is shared.
+fn input_inventory(l: &Loaded) -> Result<BTreeMap<PathBuf, PathBuf>> {
+    let mut logical = BTreeMap::new();
+    let mut unique = BTreeSet::new();
+    let mut total = 0u64;
     for n in &l.manifest.nodes {
         for r in n.action.references() {
             if let Reference::File { file } = r {
+                if logical.contains_key(file) {
+                    continue;
+                }
                 let path = safe_path(&l.base, file)?;
-                out.insert(file.clone(), crate::media::file_sha256(&path)?);
+                let canonical = path.canonicalize()?;
+                if !canonical.starts_with(&l.base) {
+                    bail!("project input resolves outside manifest directory");
+                }
+                // Open the original checked path, retaining no symlink-following opener.
+                let length = regular(&path, false)?.metadata()?.len();
+                if length > INPUT_IMAGE_LIMIT {
+                    bail!("project image input exceeds 16 MiB: {}", file.display());
+                }
+                if unique.insert(canonical.clone()) {
+                    total = total
+                        .checked_add(length)
+                        .context("project input size overflow")?;
+                    if total > INPUT_TOTAL_LIMIT {
+                        bail!("unique project image inputs exceed 256 MiB");
+                    }
+                }
+                logical.insert(file.clone(), canonical);
             }
         }
     }
-    Ok(out)
+    Ok(logical)
+}
+fn input_digest(reader: impl Read, limit: u64) -> Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    // Metadata is only early admission. A concurrently growing file cannot
+    // exceed the actual-byte bound; read one sentinel byte to detect overflow.
+    let mut reader = reader.take(limit + 1);
+    let mut hash = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        #[cfg(test)]
+        INPUT_HASH_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > limit {
+            bail!("project image input exceeds admitted byte limit");
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok((
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        total,
+    ))
+}
+fn inputs(l: &Loaded) -> Result<BTreeMap<PathBuf, String>> {
+    let logical = input_inventory(l)?;
+    let mut hashes = BTreeMap::new();
+    let mut total = 0u64;
+    for path in logical.values() {
+        if !hashes.contains_key(path) {
+            let input = regular(path, false)?;
+            if input.metadata()?.len() > INPUT_IMAGE_LIMIT {
+                bail!("project image input exceeds 16 MiB: {}", path.display());
+            }
+            let limit = INPUT_IMAGE_LIMIT.min(INPUT_TOTAL_LIMIT - total);
+            let (hash, length) = input_digest(input, limit)?;
+            total += length;
+            hashes.insert(path.clone(), hash);
+        }
+    }
+    logical
+        .into_iter()
+        .map(|(file, path)| Ok((file, hashes[&path].clone())))
+        .collect()
 }
 fn state_dir(l: &Loaded) -> Result<PathBuf> {
     let home = crate::workspace::personal_home()?;
