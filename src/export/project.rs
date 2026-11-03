@@ -376,6 +376,16 @@ registerRoot(Root);
     Ok(warnings)
 }
 
+/// Browsers play mono as full-level dual mono; Skywrite's FFmpeg render (and
+/// Remotion's FFmpeg mix) upmix mono at -3 dB per channel. Match the render.
+fn browser_upmix_gain(media: &crate::media::MediaInfo) -> f64 {
+    if media.audio().and_then(|a| a.channels) == Some(1) {
+        std::f64::consts::FRAC_1_SQRT_2
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,15 +411,5 @@ mod tests {
         let output = dir.path().join("failed");
         assert!(publish_reserved(&dir.path().join("missing-staging"), &output).is_err());
         assert!(!output.exists(), "failed reservation must be removed");
-    }
-}
-
-/// Browsers play mono as full-level dual mono; Skywrite's FFmpeg render (and
-/// Remotion's FFmpeg mix) upmix mono at -3 dB per channel. Match the render.
-fn browser_upmix_gain(media: &crate::media::MediaInfo) -> f64 {
-    if media.audio().and_then(|a| a.channels) == Some(1) {
-        std::f64::consts::FRAC_1_SQRT_2
-    } else {
-        1.0
     }
 }
