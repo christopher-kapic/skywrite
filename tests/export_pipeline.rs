@@ -1,7 +1,8 @@
 //! Tests at the real FFmpeg boundary, not merely serialized command strings.
+use serde_json::{Value, json};
 use skywrite::{
     export, media, process,
-    timeline::{self, AudioClip, Clip, Edit, Rational},
+    timeline::{self, Edit},
 };
 use std::{ffi::OsString, fs, path::Path, time::Duration};
 fn command(program: &str, args: &[&str]) -> std::process::Output {
@@ -106,54 +107,25 @@ fn make_fixtures(dir: &Path) {
         ],
     );
 }
-fn edit() -> Edit {
-    Edit {
-        version: 1,
-        name: "A 'quoted' & <edit>".into(),
-        width: 160,
-        height: 90,
-        fps: Rational { num: 30, den: 1 },
-        clips: vec![
-            Clip {
-                source: Some("speaker's $(touch HACKED) & <take>.mp4".into()),
-                source_in: 1.25,
-                duration: 0.5,
-                speed: 2.0,
-                volume: 0.0,
-            },
-            Clip {
-                source: None,
-                source_in: 0.0,
-                duration: 0.2,
-                speed: 1.0,
-                volume: 1.0,
-            },
-            Clip {
-                source: Some("green.mp4".into()),
-                source_in: 0.0,
-                duration: 0.5,
-                speed: 0.5,
-                volume: 1.0,
-            },
-            Clip {
-                source: Some("title.png".into()),
-                source_in: 0.0,
-                duration: 0.3,
-                speed: 1.0,
-                volume: 1.0,
-            },
-        ],
-        captions: vec![],
-        chapters: vec![],
-        audio: vec![AudioClip {
-            source: "voice.wav".into(),
-            source_in: 0.1,
-            offset: 0.7,
-            duration: 0.5,
-            speed: 1.01,
-            volume: 0.7,
-        }],
-    }
+fn edit() -> Value {
+    json!({
+        "version": 2,
+        "name": "A 'quoted' & <edit>",
+        "width": 160,
+        "height": 90,
+        "fps": {"num": 30, "den": 1},
+        "video": [{"clips": [
+            {"start": 0, "source": "speaker's $(touch HACKED) & <take>.mp4", "source_in": 1.25, "duration": 0.5, "speed": 2.0, "audio": {"volume": 0}},
+            {"start": 0.7, "source": "green.mp4", "duration": 0.5, "speed": 0.5},
+            {"start": 1.2, "source": "title.png", "duration": 0.3}
+        ]}],
+        "audio": [{"clips": [
+            {"start": 0.7, "source": "voice.wav", "source_in": 0.1, "duration": 0.5, "speed": 1.01, "volume": 0.7}
+        ]}]
+    })
+}
+fn build(value: &Value) -> Edit {
+    timeline::parse(value.clone()).unwrap()
 }
 fn center(path: &Path, time: &str) -> [u8; 3] {
     let result = command(
@@ -218,7 +190,7 @@ fn rms(path: &Path, start: &str, duration: &str) -> f64 {
 fn real_render_preserves_timing_picture_and_audio() {
     let dir = tempfile::tempdir().unwrap();
     make_fixtures(dir.path());
-    let validated = timeline::validate(&edit(), dir.path()).unwrap();
+    let validated = timeline::validate(&build(&edit()), dir.path()).unwrap();
     let output = dir.path().join("render.mp4");
     export::render(&validated, &output, false).unwrap();
     let info = media::probe(&output).unwrap();
@@ -275,7 +247,7 @@ fn real_render_preserves_timing_picture_and_audio() {
 fn interchange_and_python_export_work_with_hostile_names() {
     let dir = tempfile::tempdir().unwrap();
     make_fixtures(dir.path());
-    let validated = timeline::validate(&edit(), dir.path()).unwrap();
+    let validated = timeline::validate(&build(&edit()), dir.path()).unwrap();
     let fcpxml = dir.path().join("edit.fcpxml");
     export::export(&validated, "fcpxml", &fcpxml, false).unwrap();
     let check = r#"import sys,xml.etree.ElementTree as E
@@ -332,8 +304,8 @@ fn hyperframes_html_excludes_human_metadata_and_preserves_edit_data() {
     let dir = tempfile::tempdir().unwrap();
     make_fixtures(dir.path());
     let mut specification = edit();
-    specification.name = "Ordinary edit".into();
-    let ordinary = timeline::validate(&specification, dir.path()).unwrap();
+    specification["name"] = json!("Ordinary edit");
+    let ordinary = timeline::validate(&build(&specification), dir.path()).unwrap();
     let ordinary_project = dir.path().join("ordinary");
     export::export(&ordinary, "hyperframes", &ordinary_project, false).unwrap();
     let expected_html = fs::read_to_string(ordinary_project.join("index.html")).unwrap();
@@ -353,7 +325,7 @@ fn hyperframes_html_excludes_human_metadata_and_preserves_edit_data() {
     // characters without adding executable content to any runtime fixture.
     let renamed_image = "封面 'quoted' & <caption>.png";
     fs::rename(dir.path().join("title.png"), dir.path().join(renamed_image)).unwrap();
-    specification.clips[3].source = Some(renamed_image.into());
+    specification["video"][0]["clips"][2]["source"] = json!(renamed_image);
     for (index, name) in [
         "A 'quoted' & <caption> Ω 🎬",
         "Escaped-looking &lt;caption&gt; &amp; &#34; text",
@@ -361,8 +333,8 @@ fn hyperframes_html_excludes_human_metadata_and_preserves_edit_data() {
     .into_iter()
     .enumerate()
     {
-        specification.name = name.into();
-        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        specification["name"] = json!(name);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
         let project = dir.path().join(format!("text-{index}"));
         export::export(&validated, "hyperframes", &project, false).unwrap();
         assert_eq!(
@@ -375,7 +347,7 @@ fn hyperframes_html_excludes_human_metadata_and_preserves_edit_data() {
                 .unwrap();
         assert_eq!(saved["name"], name);
         assert!(
-            saved["clips"][3]["source"]
+            saved["video"][0]["clips"][2]["source"]
                 .as_str()
                 .unwrap()
                 .ends_with(renamed_image)
@@ -445,18 +417,12 @@ fn delayed_stream_presentation_times_survive_trim_and_retime() {
     .enumerate()
     {
         let mut specification = edit();
-        specification.audio.clear();
-        specification.clips = vec![Clip {
-            source: Some(input.clone()),
-            source_in,
-            duration,
-            speed,
-            volume: 1.0,
-        }];
-        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        specification["audio"] = json!([]);
+        specification["video"] = json!([{"clips":[{"start":0,"source":input,"source_in":source_in,"duration":duration,"speed":speed}]}]);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
         let output = dir.path().join(format!("delayed-{index}.mp4"));
         export::render(&validated, &output, false).unwrap();
-        let onset = ((0.5 - source_in) / speed).max(0.0);
+        let onset: f64 = ((0.5f64 - source_in) / speed).max(0.0);
         if onset > 0.1 {
             assert!(
                 rms(&output, "0.02", &(onset.min(duration) - 0.05).to_string()) < 0.0001,
@@ -503,36 +469,22 @@ fn delayed_video_prefix_is_counted_once_in_both_renderers() {
         ],
     );
     for (index, (source_in, speed, duration, fps)) in [
-        (0.0, 0.5, 4.0, Rational { num: 30, den: 1 }),
-        (0.0, 1.0, 2.0, Rational { num: 30, den: 1 }),
-        (0.0, 2.0, 1.5, Rational { num: 30, den: 1 }),
-        (
-            0.5,
-            1.0,
-            2.0,
-            Rational {
-                num: 30000,
-                den: 1001,
-            },
-        ),
-        (1.5, 1.0, 1.0, Rational { num: 30, den: 1 }),
-        (0.0, 1.0, 0.5, Rational { num: 30, den: 1 }),
-        (0.5, 0.5, 0.5, Rational { num: 30, den: 1 }),
+        (0.0, 0.5, 4.0, json!({"num": 30, "den": 1})),
+        (0.0, 1.0, 2.0, json!({"num": 30, "den": 1})),
+        (0.0, 2.0, 1.5, json!({"num": 30, "den": 1})),
+        (0.5, 1.0, 2.0, json!({"num": 30000, "den": 1001})),
+        (1.5, 1.0, 1.0, json!({"num": 30, "den": 1})),
+        (0.0, 1.0, 0.5, json!({"num": 30, "den": 1})),
+        (0.5, 0.5, 0.5, json!({"num": 30, "den": 1})),
     ]
     .into_iter()
     .enumerate()
     {
         let mut specification = edit();
-        specification.audio.clear();
-        specification.fps = fps;
-        specification.clips = vec![Clip {
-            source: Some(input.clone()),
-            source_in,
-            duration,
-            speed,
-            volume: 1.0,
-        }];
-        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        specification["audio"] = json!([]);
+        specification["fps"] = json!(fps);
+        specification["video"] = json!([{"clips":[{"start":0,"source":input,"source_in":source_in,"duration":duration,"speed":speed}]}]);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
         let script = dir.path().join(format!("video-{index}.py"));
         export::export(&validated, "ffmpeg", &script, false).unwrap();
         for python in [false, true] {
@@ -549,7 +501,7 @@ fn delayed_video_prefix_is_counted_once_in_both_renderers() {
             } else {
                 export::render(&validated, &output, false).unwrap();
             }
-            let onset = ((1.0 - source_in) / speed).max(0.0);
+            let onset: f64 = ((1.0f64 - source_in) / speed).max(0.0);
             if onset > 0.1 {
                 let black = center(&output, &(onset.min(duration) * 0.5).to_string());
                 assert!(
@@ -605,22 +557,10 @@ fn additional_audio_preserves_content_before_delayed_video() {
     );
     for (index, source_in) in [0.0, 0.5].into_iter().enumerate() {
         let mut specification = edit();
-        specification.clips = vec![Clip {
-            source: None,
-            source_in: 0.0,
-            duration: 0.5,
-            speed: 1.0,
-            volume: 1.0,
-        }];
-        specification.audio = vec![AudioClip {
-            source: source.clone(),
-            source_in,
-            offset: 0.0,
-            duration: 0.5,
-            speed: 1.0,
-            volume: 1.0,
-        }];
-        let validated = timeline::validate(&specification, dir.path()).unwrap();
+        specification["video"] = json!([]);
+        specification["audio"] =
+            json!([{"clips":[{"start":0,"source":source,"source_in":source_in,"duration":0.5}]}]);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
         let script = dir.path().join(format!("audio-prefix-{index}.py"));
         export::export(&validated, "ffmpeg", &script, false).unwrap();
         for python in [false, true] {
@@ -652,7 +592,7 @@ fn additional_audio_preserves_content_before_delayed_video() {
 fn python_renderer_cleans_owned_groups_on_cancel_timeout_and_failure() {
     let dir = tempfile::tempdir().unwrap();
     make_fixtures(dir.path());
-    let validated = timeline::validate(&edit(), dir.path()).unwrap();
+    let validated = timeline::validate(&build(&edit()), dir.path()).unwrap();
     let script = dir.path().join("render.py");
     export::export(&validated, "ffmpeg", &script, false).unwrap();
     let probe = r#"import os,sys,pathlib,subprocess,time,signal,stat,json

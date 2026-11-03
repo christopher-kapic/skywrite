@@ -532,7 +532,7 @@ async fn download(
     if overwrite {
         temp.persist(destination).map_err(|e| e.error)?;
     } else {
-        temp.persist_noclobber(destination).map_err(|e| e.error)?;
+        crate::io::persist_new(temp, destination)?;
     }
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;

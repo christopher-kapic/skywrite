@@ -1,7 +1,7 @@
 //! Optional HTML/React composition projects. Original media are copied, never linked.
 use super::number;
 use crate::{
-    captions, media,
+    captions,
     timeline::{MediaKind, ValidatedEdit},
 };
 use anyhow::{Context, Result, ensure};
@@ -61,11 +61,11 @@ pub(super) fn export(edit: &ValidatedEdit, target: &str, output: &Path) -> Resul
             .with_context(|| format!("copying {}", source.display()))?;
         sources.insert(source.to_owned(), name);
     }
-    if target == "hyperframes" {
-        hyperframes(edit, staging.path(), &sources)?;
+    let target_warnings = if target == "hyperframes" {
+        hyperframes(edit, staging.path(), &sources)?
     } else {
-        remotion(edit, staging.path(), &sources)?;
-    }
+        remotion(edit, staging.path(), &sources)?
+    };
     for (index, track) in edit.captions.iter().enumerate() {
         for format in ["srt", "vtt"] {
             fs::write(
@@ -88,6 +88,10 @@ pub(super) fn export(edit: &ValidatedEdit, target: &str, output: &Path) -> Resul
     )?;
     publish_project(staging.path(), output)?;
     let mut warnings = edit.warnings.clone();
+    warnings.extend(target_warnings);
+    if let Some(limit) = edit.master.limiter_db {
+        warnings.push(format!("Composition projects do not apply the {limit} dBFS master limiter; add one when finishing."));
+    }
     if !edit.captions.is_empty() || !edit.chapters.is_empty() {
         warnings.push("Captions and chapters are preserved in sidecars. After rendering, run skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4 to apply soft tracks, explicit burn-in, and chapters.".into());
     }
@@ -164,10 +168,15 @@ fn publish_reserved(staging: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>) -> Result<()> {
+fn hyperframes(
+    edit: &ValidatedEdit,
+    dir: &Path,
+    sources: &HashMap<PathBuf, String>,
+) -> Result<Vec<String>> {
     // Hyperframes rewrites this HTML before rendering. Keep human names only in
     // edit.validated.json: even escaped presentation text need not cross that
     // executable-document boundary. Media references use generated asset IDs.
+    let mut warnings = Vec::new();
     let mut html = format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width={}, height={}\"><title>Skywrite composition</title>\n<script src=\"https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js\"></script>\n<style>*{{box-sizing:border-box;margin:0}}html,body{{width:{}px;height:{}px;overflow:hidden;background:#000}}.clip{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}}#root{{position:relative;width:100%;height:100%;background:#000}}</style></head><body>\n<div id=\"root\" data-composition-id=\"main\" data-start=\"0\" data-duration=\"{}\" data-width=\"{}\" data-height=\"{}\" data-fps=\"{}\">\n",
         edit.width,
@@ -179,52 +188,86 @@ fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, Stri
         edit.height,
         edit.fps.ffmpeg()
     );
-    for (index, clip) in edit.clips.iter().enumerate() {
-        if clip.kind == MediaKind::Gap {
-            continue;
-        }
-        let source = clip.source.as_ref().context("validated source missing")?;
+    let mut tweens = String::new();
+    let mut envelopes = false;
+    for clip in edit.video_clips() {
+        let id = format!("v{}_{}", clip.track, clip.index);
+        let start = edit.fps.seconds(clip.start_frames);
+        let duration = edit.fps.seconds(clip.duration_frames);
         let common = format!(
-            "id=\"shot{index}\" class=\"clip\" data-start=\"{}\" data-duration=\"{}\" data-track-index=\"0\"",
-            number(edit.fps.seconds(clip.offset_frames)),
-            number(edit.fps.seconds(clip.duration_frames))
+            "id=\"{id}\" class=\"clip\" style=\"z-index:{};opacity:{}\" data-start=\"{}\" data-duration=\"{}\" data-track-index=\"{}\"",
+            clip.track + 1,
+            number(clip.opacity),
+            number(start),
+            number(duration),
+            clip.track
         );
-        let src = format!("assets/{}", sources[source]);
+        let src = format!("assets/{}", sources[&clip.source]);
         if clip.kind == MediaKind::Image {
             writeln!(html, "<img {common} src=\"{src}\" alt=\"Image\">")?;
         } else {
+            envelopes |= !clip.audio.keyframes.is_empty()
+                || clip.audio.fade_in > 0.0
+                || clip.audio.fade_out > 0.0;
             writeln!(
                 html,
                 "<video {common} src=\"{src}\" data-media-start=\"{}\" data-playback-rate=\"{}\" data-volume=\"{}\" {} playsinline preload=\"auto\"></video>",
                 number(clip.source_in),
                 number(clip.speed),
-                number(clip.volume),
-                if clip.volume == 0.0
-                    || !clip.media.as_ref().is_some_and(media::MediaInfo::has_audio)
-                {
-                    "muted"
-                } else {
+                number(clip.audio.volume * browser_upmix_gain(&clip.media)),
+                if clip.has_audible_sound() {
                     "data-has-audio=\"true\""
+                } else {
+                    "muted"
                 }
             )?;
         }
+        if clip.fade_in > 0.0 {
+            write!(
+                tweens,
+                "tl.fromTo('#{id}',{{opacity:0}},{{opacity:{},duration:{},ease:'none'}},{});",
+                number(clip.opacity),
+                number(clip.fade_in),
+                number(start)
+            )?;
+        }
+        if clip.fade_out > 0.0 {
+            write!(
+                tweens,
+                "tl.fromTo('#{id}',{{opacity:{}}},{{opacity:0,duration:{},ease:'none'}},{});",
+                number(clip.opacity),
+                number(clip.fade_out),
+                number(start + duration - clip.fade_out)
+            )?;
+        }
     }
-    for (index, clip) in edit.audio.iter().enumerate() {
+    let base_track = edit.video_tracks().len();
+    for clip in edit.audio_clips().filter(|c| c.mix.audible()) {
+        envelopes |=
+            !clip.mix.keyframes.is_empty() || clip.mix.fade_in > 0.0 || clip.mix.fade_out > 0.0;
         writeln!(
             html,
-            "<audio id=\"audio{index}\" src=\"assets/{}\" data-start=\"{}\" data-duration=\"{}\" data-media-start=\"{}\" data-playback-rate=\"{}\" data-volume=\"{}\" data-track-index=\"{}\" preload=\"auto\"></audio>",
+            "<audio id=\"a{}_{}\" src=\"assets/{}\" data-start=\"{}\" data-duration=\"{}\" data-media-start=\"{}\" data-playback-rate=\"{}\" data-volume=\"{}\" data-track-index=\"{}\" preload=\"auto\"></audio>",
+            clip.track,
+            clip.index,
             sources[&clip.source],
-            number(edit.fps.seconds(clip.offset_frames)),
+            number(edit.fps.seconds(clip.start_frames)),
             number(edit.fps.seconds(clip.duration_frames)),
             number(clip.source_in),
             number(clip.speed),
-            number(clip.volume),
-            index + 1
+            number(clip.mix.volume * browser_upmix_gain(&clip.media)),
+            base_track + clip.track
         )?;
+    }
+    if envelopes {
+        warnings.push("Hyperframes media use one constant volume per clip; volume keyframes and audio fades are not applied. Use the FFmpeg/Remotion targets, or add them in the composition.".into());
+    }
+    if !edit.luts.is_empty() {
+        warnings.push("Hyperframes compositions do not apply LUTs; colors will differ from the native render.".into());
     }
     writeln!(
         html,
-        "</div><script>window.__timelines = window.__timelines || {{}}; const tl = gsap.timeline({{paused:true}}); window.__timelines.main = tl; tl.to({{}}, {{duration:{}}}); tl.seek(0);</script></body></html>",
+        "</div><script>window.__timelines = window.__timelines || {{}}; const tl = gsap.timeline({{paused:true}}); window.__timelines.main = tl; tl.to({{}}, {{duration:{}}}); {tweens} tl.seek(0);</script></body></html>",
         number(edit.duration())
     )?;
     fs::write(dir.join("index.html"), html)?;
@@ -236,20 +279,39 @@ fn hyperframes(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, Stri
     )?;
     fs::write(
         dir.join("README.md"),
-        "Generated by Skywrite. Uses your installed Hyperframes CLI.\n\nRun `hyperframes lint .`, `hyperframes check .`, and `hyperframes render . -o edit.mp4`.\n\nAssets are copies. Timing, source trims, playback rates, and linear gains come from the validated edit. Captions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`. The pinned GSAP script may require network access unless your Hyperframes installation provides its vendor cache.\n",
+        "Generated by Skywrite. Uses your installed Hyperframes CLI.\n\nRun `hyperframes lint .`, `hyperframes check .`, and `hyperframes render . -o edit.mp4`.\n\nAssets are copies. Layers, timing, source trims, playback rates, opacity, picture fades and constant gains come from the validated edit. Captions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`. The pinned GSAP script may require network access unless your Hyperframes installation provides its vendor cache.\n",
     )?;
-    Ok(())
+    Ok(warnings)
 }
 
-fn remotion(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>) -> Result<()> {
+fn remotion(
+    edit: &ValidatedEdit,
+    dir: &Path,
+    sources: &HashMap<PathBuf, String>,
+) -> Result<Vec<String>> {
     let fps = edit.fps.value();
+    let mut warnings = Vec::new();
+    // Layers render in array order, so the bottom track comes first.
     let mut shots = Vec::new();
-    for clip in &edit.clips {
-        shots.push(json!({"source":clip.source.as_ref().map(|s|format!("media/{}",sources[s])),"kind":clip.kind,"from":clip.offset_frames,"duration":clip.duration_frames,"trim":(clip.source_in*fps).round() as u64,"speed":clip.speed,"volume":clip.volume}));
+    for clip in edit.video_clips() {
+        let duration = edit.fps.seconds(clip.duration_frames);
+        shots.push(json!({"source":format!("media/{}",sources[&clip.source]),"kind":clip.kind,"track":clip.track,
+            "from":clip.start_frames,"duration":clip.duration_frames,"trim":(clip.source_in*fps).round() as u64,"speed":clip.speed,
+            "opacity":clip.opacity,"fade_in":clip.fade_in,"fade_out":clip.fade_out,
+            "gain":clip.has_audible_sound().then(|| clip.audio.breakpoints(duration).iter().map(|k| [k.time,k.volume]).collect::<Vec<_>>())}));
     }
     let mut audio = Vec::new();
-    for clip in &edit.audio {
-        audio.push(json!({"source":format!("media/{}",sources[&clip.source]),"from":clip.offset_frames,"duration":clip.duration_frames,"trim":(clip.source_in*fps).round() as u64,"speed":clip.speed,"volume":clip.volume}));
+    for clip in edit.audio_clips().filter(|c| c.mix.audible()) {
+        let duration = edit.fps.seconds(clip.duration_frames);
+        audio.push(json!({"source":format!("media/{}",sources[&clip.source]),"from":clip.start_frames,"duration":clip.duration_frames,
+            "trim":(clip.source_in*fps).round() as u64,"speed":clip.speed,
+            "gain":clip.mix.breakpoints(duration).iter().map(|k| [k.time,k.volume]).collect::<Vec<_>>()}));
+    }
+    if !edit.luts.is_empty() {
+        warnings.push(
+            "Remotion compositions do not apply LUTs; colors will differ from the native render."
+                .into(),
+        );
     }
     let data = json!({"width":edit.width,"height":edit.height,"fps":fps,"duration":edit.duration_frames,"shots":shots,"audio":audio});
     fs::write(dir.join("edit.json"), serde_json::to_vec_pretty(&data)?)?;
@@ -264,18 +326,43 @@ fn remotion(edit: &ValidatedEdit, dir: &Path, sources: &HashMap<PathBuf, String>
     fs::write(
         dir.join("index.jsx"),
         r#"import React from 'react';
-import {AbsoluteFill, Composition, Img, OffthreadVideo, Html5Audio, Sequence, registerRoot, staticFile} from 'remotion';
+import {AbsoluteFill, Composition, Img, OffthreadVideo, Html5Audio, Sequence, registerRoot, staticFile, useCurrentFrame, interpolate} from 'remotion';
 import edit from './edit.json';
 
 const style = {width: '100%', height: '100%', objectFit: 'contain'};
+// Piecewise-linear gain from [seconds, gain] breakpoints, relative to clip start.
+const gainAt = (points, seconds) => {
+  if (!points || points.length === 0) return 0;
+  if (seconds <= points[0][0]) return points[0][1];
+  for (let i = 1; i < points.length; i++) {
+    const [t1, g1] = points[i];
+    if (seconds <= t1) {
+      const [t0, g0] = points[i - 1];
+      return t1 === t0 ? g1 : g0 + (g1 - g0) * (seconds - t0) / (t1 - t0);
+    }
+  }
+  return points[points.length - 1][1];
+};
+const Shot = ({shot}) => {
+  const frame = useCurrentFrame();
+  const seconds = frame / edit.fps;
+  const length = shot.duration / edit.fps;
+  let opacity = shot.opacity;
+  if (shot.fade_in > 0) opacity *= interpolate(seconds, [0, shot.fade_in], [0, 1], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  if (shot.fade_out > 0) opacity *= interpolate(seconds, [length - shot.fade_out, length], [1, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+  return <AbsoluteFill style={{opacity}}>
+    {shot.kind === 'image' ? <Img src={staticFile(shot.source)} style={style}/> :
+      <OffthreadVideo src={staticFile(shot.source)} trimBefore={shot.trim} playbackRate={shot.speed}
+        muted={!shot.gain} volume={(f) => gainAt(shot.gain, f / edit.fps)} preservePitch style={style}/>}
+  </AbsoluteFill>;
+};
 const Film = () => <AbsoluteFill style={{backgroundColor: 'black'}}>
   {edit.shots.map((shot, index) => <Sequence key={index} from={shot.from} durationInFrames={shot.duration}>
-    {shot.kind === 'gap' ? <AbsoluteFill style={{backgroundColor: 'black'}}/> : shot.kind === 'image' ?
-      <Img src={staticFile(shot.source)} style={style}/> :
-      <OffthreadVideo src={staticFile(shot.source)} trimBefore={shot.trim} playbackRate={shot.speed} volume={shot.volume} muted={shot.volume === 0} preservePitch style={style}/>}
+    <Shot shot={shot}/>
   </Sequence>)}
   {edit.audio.map((sound, index) => <Sequence key={index} from={sound.from} durationInFrames={sound.duration}>
-    <Html5Audio src={staticFile(sound.source)} trimBefore={sound.trim} playbackRate={sound.speed} volume={sound.volume} preservePitch/>
+    <Html5Audio src={staticFile(sound.source)} trimBefore={sound.trim} playbackRate={sound.speed}
+      volume={(f) => gainAt(sound.gain, f / edit.fps)} preservePitch/>
   </Sequence>)}
 </AbsoluteFill>;
 const Root = () => <Composition id="Skywrite" component={Film} width={edit.width} height={edit.height} fps={edit.fps} durationInFrames={edit.duration}/>;
@@ -284,9 +371,9 @@ registerRoot(Root);
     )?;
     fs::write(
         dir.join("README.md"),
-        "Generated by Skywrite. Assets are copies. Install the pinned optional runtime with `npm install`, then run `npm run studio` or `npm run render`.\n\nCaptions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`.\n\nRemotion's license applies to its runtime; see https://www.remotion.dev/license. Source trims are rounded to composition-frame boundaries. This exporter accepts integer FPS; use FCPXML or FFmpeg for NTSC rates.\n",
+        "Generated by Skywrite. Assets are copies. Install the pinned optional runtime with `npm install`, then run `npm run studio` or `npm run render`.\n\nLayers, opacity, picture fades, gain keyframes and audio fades come from the validated edit (edit.json). Captions and chapters are preserved in sidecars; apply them after rendering with `skywrite captions mux VIDEO --edit ORIGINAL_EDIT --output FINISHED.mp4`.\n\nRemotion's license applies to its runtime; see https://www.remotion.dev/license. Source trims are rounded to composition-frame boundaries. This exporter accepts integer FPS; use FCPXML or FFmpeg for NTSC rates.\n",
     )?;
-    Ok(())
+    Ok(warnings)
 }
 
 #[cfg(test)]
@@ -314,5 +401,15 @@ mod tests {
         let output = dir.path().join("failed");
         assert!(publish_reserved(&dir.path().join("missing-staging"), &output).is_err());
         assert!(!output.exists(), "failed reservation must be removed");
+    }
+}
+
+/// Browsers play mono as full-level dual mono; Skywrite's FFmpeg render (and
+/// Remotion's FFmpeg mix) upmix mono at -3 dB per channel. Match the render.
+fn browser_upmix_gain(media: &crate::media::MediaInfo) -> f64 {
+    if media.audio().and_then(|a| a.channels) == Some(1) {
+        std::f64::consts::FRAC_1_SQRT_2
+    } else {
+        1.0
     }
 }

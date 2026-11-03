@@ -58,7 +58,14 @@ fn wav(path: &Path) {
     );
 }
 fn gap(path: &Path) {
-    std::fs::write(path, serde_json::to_vec(&json!({"version":1,"width":32,"height":32,"fps":{"num":10,"den":1},"clips":[{"duration":0.2}]})).unwrap()).unwrap();
+    std::fs::write(
+        path,
+        serde_json::to_vec(
+            &json!({"version":2,"width":32,"height":32,"fps":{"num":10,"den":1},"duration":0.2}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
 }
 fn transcript(path: &Path, source: &Path) {
     std::fs::write(path,serde_json::to_vec(&json!({"version":1,"source":source,"duration":1,"text":"hello","words":[{"text":"hello","start":0,"end":0.5}]})).unwrap()).unwrap();

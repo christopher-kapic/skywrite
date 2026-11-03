@@ -89,16 +89,68 @@ pub fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
             .map_err(|e| e.error)
             .with_context(|| format!("writing {}", path.display()))?;
     } else {
-        temp.persist_noclobber(path)
-            .map_err(|e| e.error)
-            .with_context(|| {
-                format!(
-                    "writing {}; output exists? use --overwrite to replace it",
-                    path.display()
-                )
-            })?;
+        persist_new(temp, path).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Publish a completed temporary file at a path that must not exist yet.
+///
+/// The atomic no-replace rename/link is tried first. Some filesystems (for
+/// example exFAT on macOS, which reports ENOTSUP) do not support it; then the
+/// destination is created exclusively (O_CREAT|O_EXCL) and the bytes copied,
+/// so an existing file is still never replaced. That fallback is not atomic:
+/// a failed copy removes the partial destination.
+pub fn persist_new(temp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    let error = match temp.persist_noclobber(path) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+        bail!("output already exists; pass --overwrite to replace it");
+    }
+    if !unsupported(&error.error) {
+        return Err(error.error).context("publishing output");
+    }
+    let mut source = error.file.reopen()?;
+    let mut destination = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("output already exists; pass --overwrite to replace it")
+        }
+        Err(e) => return Err(e).context("creating output"),
+    };
+    let copied = std::io::copy(&mut source, &mut destination).and_then(|_| destination.sync_all());
+    if let Err(e) = copied {
+        drop(destination);
+        let _ = std::fs::remove_file(path);
+        return Err(e)
+            .context("copying output on a filesystem without atomic no-replace publication");
+    }
+    Ok(())
+}
+
+fn unsupported(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::Unsupported)
+        || error.raw_os_error().is_some_and(|code| {
+            #[cfg(unix)]
+            {
+                code == libc::ENOTSUP
+                    || code == libc::EOPNOTSUPP
+                    || code == libc::ENOSYS
+                    || code == libc::EPERM
+                    || code == libc::EINVAL
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = code;
+                false
+            }
+        })
 }
 #[cfg(test)]
 mod tests {
@@ -112,5 +164,15 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"first");
         atomic_write(&p, b"second", true).unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"second");
+        let message = format!("{:#}", atomic_write(&p, b"third", false).unwrap_err());
+        assert!(message.contains("already exists"), "{message}");
+        // exFAT on macOS reports ENOTSUP for exclusive rename; that triggers the
+        // exclusive-create fallback rather than a misleading --overwrite hint.
+        assert!(unsupported(&std::io::Error::from_raw_os_error(
+            libc::ENOTSUP
+        )));
+        assert!(!unsupported(&std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists
+        )));
     }
 }

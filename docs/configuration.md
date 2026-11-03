@@ -33,7 +33,7 @@ Selection precedence is:
 2. `SKYWRITE_<TASK>_MODEL`, with dashes in the task changed to underscores.
 3. `OPENROUTER_VISION_MODEL` for analysis and editing, for compatibility.
 4. The saved task preference.
-5. The existing `openai/whisper-large-v3` transcription fallback.
+5. The `elevenlabs/scribe-v2` transcription fallback (verbatim: it keeps fillers and repeated words; see [model evaluation](model-evaluation.md)).
 
 An unset task is reported with a null model; it does not silently select a paid
 model. Image upscaling currently uses local FFmpeg Lanczos resizing. Its query
@@ -58,8 +58,10 @@ and makes no paid request. Malformed or oversized existing config is rejected
 without replacement.
 
 The starter choices are intentionally stable preferences rather than an
-automatically changing ranking: Gemini Flash Lite for analysis/editing,
-Whisper for word transcription, FLUX 3 Image Klein for images, H3 Max for video,
+automatically changing ranking: Gemini Flash Lite for analysis/editing, GPT-6
+Luna for per-frame descriptions, Gemini 3.1 Flash Lite for video descriptions,
+ElevenLabs Scribe v2 for verbatim word transcription (chosen in a measured
+[model evaluation](model-evaluation.md)), FLUX 3 Image Klein for images, H3 Max for video,
 FLUX Video Upscale, Kokoro for speech, and Lyria 3 Clip for music. The command
 prints the exact IDs, curation date, and reasons. Model availability and prices
 can change; `init` does not guarantee current provider availability. Use
@@ -72,3 +74,15 @@ personal directory. For paid requests, set `OPENROUTER_API_KEY` in the
 environment inherited by the agent process. An export in a different terminal
 does not update an already running agent. Storage settings and credentials are
 separate; `init` does not create buckets or enable public access.
+
+## Data policy for media understanding
+
+Requests that send your media or words to a model (transcription, analysis,
+frame and video descriptions, edit suggestions) are routed only to providers
+that neither train on nor retain the data: OpenRouter's `data_collection: deny`
+plus zero-data-retention (`zdr`). Set `SKYWRITE_DATA_POLICY=no-training` to allow
+providers that retain but do not train, or `provider-default` to use OpenRouter's
+account defaults. A model with no compliant provider fails with that explanation
+instead of silently routing elsewhere. The routing setting is not part of the
+response-cache key, so cached results remain valid across policy changes.
+Generation requests (images, video, speech, music) are not affected.

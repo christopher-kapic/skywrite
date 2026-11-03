@@ -606,6 +606,7 @@ mod tests {
                 start: offset + scale * i as f64 * 0.7,
                 end: offset + scale * (i as f64 * 0.7 + 0.3),
                 confidence: Some(0.95),
+                audio_level_dbfs: None,
             })
             .collect();
         Transcript {
@@ -660,6 +661,7 @@ mod tests {
                 start: word.end + 0.02,
                 end: word.end + 0.04,
                 confidence: Some(0.9),
+                audio_level_dbfs: None,
             };
             with_insertions.push(word);
             if i % 29 == 0 {

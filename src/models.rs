@@ -9,6 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const TTL: u64 = 24 * 60 * 60;
 const MAX_CATALOG: u64 = 8 * 1024 * 1024;
 pub const TASKS: &[&str] = crate::workspace::MODEL_TASKS;
+/// Verbatim word-timestamp transcription chosen by the 2026-11-02 evaluation
+/// (docs/model-evaluation.md): keeps fillers and repeated words Whisper drops.
+pub const TRANSCRIPTION_FALLBACK: &str = "elevenlabs/scribe-v2";
 
 /// Canonical task names are persisted; short aliases are accepted at CLI boundaries.
 pub fn canonical_task(task: &str) -> Result<&'static str> {
@@ -88,7 +91,7 @@ fn selected_model(
     } else if let Some(model) = saved_model.as_ref() {
         (Some(model.clone()), "saved")
     } else if task == "transcription" {
-        (Some("openai/whisper-large-v3".into()), "builtin")
+        (Some(TRANSCRIPTION_FALLBACK.into()), "builtin")
     } else {
         (None, "unset")
     };
@@ -275,7 +278,12 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     let mut sources = Vec::new();
     let mut data = Vec::new();
     let task = options.task.map(canonical_task).transpose()?;
-    if task.is_none() || matches!(task, Some("analysis" | "editing")) {
+    if task.is_none()
+        || matches!(
+            task,
+            Some("analysis" | "editing" | "frame-description" | "video-description")
+        )
+    {
         let (catalog, metadata) = load_catalog(options, "models")?;
         sources.push(metadata);
         data.extend(
@@ -285,9 +293,15 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
                 .iter()
                 .filter(|v| {
                     has_modality(v, "output", "text")
-                        && (task != Some("analysis")
-                            || has_modality(v, "input", "image")
-                            || has_modality(v, "input", "audio"))
+                        && match task {
+                            Some("analysis") => {
+                                has_modality(v, "input", "image")
+                                    || has_modality(v, "input", "audio")
+                            }
+                            Some("frame-description") => has_modality(v, "input", "image"),
+                            Some("video-description") => has_modality(v, "input", "video"),
+                            _ => true,
+                        }
                 })
                 .cloned()
                 .map(|v| normalize(v, "chat/completions", None)),

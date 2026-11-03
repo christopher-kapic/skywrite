@@ -550,10 +550,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     if options.overwrite {
         publication.persist(&options.output).map_err(|e| e.error)?;
     } else {
-        publication
-            .persist_noclobber(&options.output)
-            .map_err(|e| e.error)
-            .context("output exists; use --overwrite to replace it")?;
+        crate::io::persist_new(publication, &options.output)?;
     }
     Ok(
         json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),

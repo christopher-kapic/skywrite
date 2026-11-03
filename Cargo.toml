@@ -19,6 +19,9 @@ serde_json = "1.0"
 sha2 = "0.11"
 tempfile = "3.23"
 url = "2.5"
+# Already in the dependency tree; NLE timeline import (xmeml, gzip .prproj).
+quick-xml = "0.41"
+flate2 = "1.1"
 # Already used by Takumi; inspect local image dimensions before decoding.
 imagesize = "0.15"
 # Original upstream stable renderer; HTML parsing and raster codecs are native.

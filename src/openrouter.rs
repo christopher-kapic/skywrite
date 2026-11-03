@@ -114,7 +114,15 @@ impl OpenRouter {
         if !matches!(endpoint, "audio/transcriptions" | "chat/completions") {
             bail!("unsupported OpenRouter endpoint");
         }
+        // Routing policy is not part of the content: keep it out of the cache key
+        // so cached results survive policy changes and are never paid for twice.
         let encoded = serde_json::to_vec(body)?;
+        let mut routed = body.clone();
+        if let Some(provider) = data_policy()? {
+            routed["provider"] = provider;
+        }
+        routed["usage"] = serde_json::json!({"include": true});
+        let sent = serde_json::to_vec(&routed)?;
         if encoded.len() > MAX_REQUEST_BYTES {
             bail!(
                 "OpenRouter request exceeds 24 MiB; shorten the selected range or reduce frame count"
@@ -150,13 +158,23 @@ impl OpenRouter {
             .bearer_auth(token)
             .header("Content-Type", "application/json")
             .header("X-Title", "Skywrite")
-            .body(encoded)
+            .body(sent)
             .send()
             .context("OpenRouter request failed")?;
         let status = response.status();
         let bytes = bounded_response(response)?;
         if !status.is_success() {
             let message: String = String::from_utf8_lossy(&bytes).chars().take(2048).collect();
+            if status.as_u16() == 404
+                && (message.contains("data policy") || message.contains("No endpoints"))
+            {
+                bail!(
+                    "OpenRouter HTTP {}: {}\nNo provider of this model satisfies the data policy ({}). Choose another model, or set {DATA_POLICY_ENV}=no-training or provider-default to relax it.",
+                    status.as_u16(),
+                    message,
+                    policy_name()
+                );
+            }
             bail!("OpenRouter HTTP {}: {}", status.as_u16(), message);
         }
         let parsed: Value =
@@ -176,6 +194,28 @@ impl OpenRouter {
             cached: false,
         })
     }
+}
+
+pub const DATA_POLICY_ENV: &str = "SKYWRITE_DATA_POLICY";
+
+fn policy_name() -> String {
+    std::env::var(DATA_POLICY_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "zero-retention".into())
+}
+
+/// Provider routing for requests that carry the user's media or words.
+/// Default: only providers that neither train on nor retain the data.
+pub fn data_policy() -> Result<Option<Value>> {
+    Ok(match policy_name().as_str() {
+        "zero-retention" => Some(serde_json::json!({"data_collection": "deny", "zdr": true})),
+        "no-training" => Some(serde_json::json!({"data_collection": "deny"})),
+        "provider-default" => None,
+        other => bail!(
+            "{DATA_POLICY_ENV} must be zero-retention, no-training or provider-default, not {other:?}"
+        ),
+    })
 }
 
 pub fn cache_key(parts: &[&[u8]]) -> String {

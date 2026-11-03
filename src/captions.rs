@@ -20,7 +20,13 @@ pub enum CaptionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptionTrack {
-    pub source: PathBuf,
+    /// An existing .srt/.vtt file or a word transcript already on the output timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+    /// Source transcripts mapped through the edit: only words that are
+    /// audible in the cut are captioned, at their output-timeline times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_transcripts: Vec<PathBuf>,
     #[serde(default = "language")]
     pub language: String,
     #[serde(default)]
@@ -298,10 +304,14 @@ pub(crate) fn validate_cues(cues: &[Cue], duration: f64) -> Result<()> {
     }
     Ok(())
 }
+/// Derives timeline cues for a `from_transcripts` track: (cues, inputs).
+pub(crate) type DeriveCues<'a> = &'a dyn Fn(&[PathBuf]) -> Result<(Vec<Cue>, Vec<PathBuf>)>;
+
 pub(crate) fn load_tracks(
     tracks: &[CaptionTrack],
     base: &Path,
     duration: f64,
+    derive: DeriveCues<'_>,
 ) -> Result<Vec<ValidatedTrack>> {
     ensure!(tracks.len() <= 8, "at most 8 caption tracks are supported");
     let mut loaded = Vec::new();
@@ -312,7 +322,41 @@ pub(crate) fn load_tracks(
             track.language.len() == 3 && track.language.bytes().all(|c| c.is_ascii_lowercase()),
             "caption language must be a three-letter lowercase ISO-639 code (or und)"
         );
-        let source = media::canonical_file(&base.join(&track.source))?;
+        if !track.from_transcripts.is_empty() {
+            ensure!(
+                track.source.is_none() && track.offset == 0.0 && track.scale == 1.0,
+                "a from_transcripts caption track takes no source, offset or scale; words are mapped through the edit"
+            );
+            ensure!(
+                track.from_transcripts.len() <= 32,
+                "a caption track can map at most 32 transcripts"
+            );
+            let paths = track
+                .from_transcripts
+                .iter()
+                .map(|p| media::canonical_file(&base.join(p)))
+                .collect::<Result<Vec<_>>>()?;
+            let (cues, inputs) = derive(&paths)?;
+            validate_cues(&cues, duration)?;
+            all_cues += cues.len();
+            ensure!(
+                all_cues <= MAX_CUES,
+                "combined caption tracks exceed 100000 cues"
+            );
+            loaded.push(ValidatedTrack {
+                source: paths[0].clone(),
+                inputs: paths.into_iter().skip(1).chain(inputs).collect(),
+                language: track.language.clone(),
+                mode: track.mode,
+                cues,
+            });
+            continue;
+        }
+        let source = track
+            .source
+            .as_ref()
+            .context("a caption track needs a source file or from_transcripts")?;
+        let source = media::canonical_file(&base.join(source))?;
         let bytes =
             io::read_files_bounded(std::slice::from_ref(&source), 8 * 1024 * 1024)?.remove(0);
         let mut inputs = Vec::new();

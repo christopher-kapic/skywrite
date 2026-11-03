@@ -1,7 +1,7 @@
 //! FCPXML 1.10, following Apple's FCPXML reference and timeMap specification.
 use super::xml;
-use crate::timeline::{self, MediaKind, Rational, ValidatedEdit};
-use anyhow::{Context, Result};
+use crate::timeline::{self, MediaKind, Rational, ValidatedEdit, ValidatedMix, ValidatedVideoClip};
+use anyhow::Result;
 use std::{collections::HashMap, fmt::Write as _, path::PathBuf};
 
 fn seconds(value: f64) -> String {
@@ -31,6 +31,154 @@ fn time_map(out: &mut String, start: f64, duration: f64, speed: f64) -> Result<(
     Ok(())
 }
 
+fn decibels(gain: f64) -> String {
+    if gain <= 0.0 {
+        "-96dB".into()
+    } else {
+        format!("{:.6}dB", (20.0 * gain.log10()).max(-96.0))
+    }
+}
+
+/// Clip-local picture opacity and fades.
+fn blend(
+    out: &mut String,
+    clip: &ValidatedVideoClip,
+    local_start: f64,
+    duration: f64,
+) -> Result<()> {
+    if clip.opacity == 1.0 && clip.fade_in == 0.0 && clip.fade_out == 0.0 {
+        return Ok(());
+    }
+    if clip.fade_in == 0.0 && clip.fade_out == 0.0 {
+        writeln!(out, "<adjust-blend amount=\"{:.6}\"/>", clip.opacity)?;
+        return Ok(());
+    }
+    let mut points = vec![(
+        0.0,
+        if clip.fade_in > 0.0 {
+            0.0
+        } else {
+            clip.opacity
+        },
+    )];
+    if clip.fade_in > 0.0 {
+        points.push((clip.fade_in, clip.opacity));
+    }
+    if clip.fade_out > 0.0 {
+        points.push((duration - clip.fade_out, clip.opacity));
+    }
+    points.push((
+        duration,
+        if clip.fade_out > 0.0 {
+            0.0
+        } else {
+            clip.opacity
+        },
+    ));
+    points.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
+    writeln!(
+        out,
+        "<adjust-blend amount=\"{:.6}\"><param name=\"amount\"><keyframeAnimation>",
+        clip.opacity
+    )?;
+    for (time, value) in points {
+        writeln!(
+            out,
+            "<keyframe time=\"{}\" value=\"{value:.6}\"/>",
+            seconds(local_start + time)
+        )?;
+    }
+    writeln!(out, "</keyframeAnimation></param></adjust-blend>")?;
+    Ok(())
+}
+
+/// Clip-local gain, keyframes and fades.
+fn volume(out: &mut String, mix: &ValidatedMix, local_start: f64) -> Result<()> {
+    if mix.is_unity() {
+        return Ok(());
+    }
+    let amount = if mix.keyframes.is_empty() {
+        decibels(mix.volume)
+    } else {
+        "0dB".into()
+    };
+    if mix.keyframes.is_empty() && mix.fade_in == 0.0 && mix.fade_out == 0.0 {
+        writeln!(out, "<adjust-volume amount=\"{amount}\"/>")?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "<adjust-volume amount=\"{amount}\"><param name=\"amount\">"
+    )?;
+    if mix.fade_in > 0.0 {
+        writeln!(
+            out,
+            "<fadeIn type=\"linear\" duration=\"{}\"/>",
+            seconds(mix.fade_in)
+        )?;
+    }
+    if mix.fade_out > 0.0 {
+        writeln!(
+            out,
+            "<fadeOut type=\"linear\" duration=\"{}\"/>",
+            seconds(mix.fade_out)
+        )?;
+    }
+    if !mix.keyframes.is_empty() {
+        writeln!(out, "<keyframeAnimation>")?;
+        for keyframe in &mix.keyframes {
+            writeln!(
+                out,
+                "<keyframe time=\"{}\" value=\"{}\"/>",
+                seconds(local_start + keyframe.time),
+                decibels(mix.volume * keyframe.volume)
+            )?;
+        }
+        writeln!(out, "</keyframeAnimation>")?;
+    }
+    writeln!(out, "</param></adjust-volume>")?;
+    Ok(())
+}
+
+fn gap(out: &mut String, edit: &ValidatedEdit, from: u64, to: u64) -> Result<()> {
+    if to > from {
+        writeln!(
+            out,
+            "<gap name=\"Gap\" offset=\"{}\" start=\"0s\" duration=\"{}\"/>",
+            edit.fps.fcpxml(from),
+            edit.fps.fcpxml(to - from)
+        )?;
+    }
+    Ok(())
+}
+
+fn file_name(path: &std::path::Path, fallback: &str) -> String {
+    xml(path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or(fallback))
+}
+
+/// FCPXML caption roles use two-letter language codes.
+fn two_letter(code: &str) -> &str {
+    match code {
+        "eng" => "en",
+        "spa" => "es",
+        "fra" | "fre" => "fr",
+        "deu" | "ger" => "de",
+        "ita" => "it",
+        "por" => "pt",
+        "nld" | "dut" => "nl",
+        "jpn" => "ja",
+        "zho" | "chi" => "zh",
+        "kor" => "ko",
+        "rus" => "ru",
+        "ara" => "ar",
+        "hin" => "hi",
+        _ => "en",
+    }
+}
+
 pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n<resources>\n",
@@ -44,25 +192,15 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
     )?;
     let mut assets = HashMap::<PathBuf, String>::new();
     let mut ordered = Vec::new();
-    for clip in &edit.clips {
-        if let (Some(source), Some(info)) = (&clip.source, &clip.media)
-            && !assets.contains_key(source)
-        {
+    for (source, info, still) in edit
+        .video_clips()
+        .map(|c| (&c.source, &c.media, c.kind == MediaKind::Image))
+        .chain(edit.audio_clips().map(|c| (&c.source, &c.media, false)))
+    {
+        if !assets.contains_key(source) {
             let id = format!("asset{}", assets.len());
             assets.insert(source.clone(), id.clone());
-            ordered.push((
-                id,
-                source.clone(),
-                info.clone(),
-                clip.kind == MediaKind::Image,
-            ));
-        }
-    }
-    for clip in &edit.audio {
-        if !assets.contains_key(&clip.source) {
-            let id = format!("asset{}", assets.len());
-            assets.insert(clip.source.clone(), id.clone());
-            ordered.push((id, clip.source.clone(), clip.media.clone(), false));
+            ordered.push((id, source.clone(), info.clone(), still));
         }
     }
     for (index, (id, source, info, still)) in ordered.iter().enumerate() {
@@ -85,13 +223,10 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
         }
         let url = url::Url::from_file_path(source)
             .map_err(|_| anyhow::anyhow!("cannot make file URL for {}", source.display()))?;
-        let name = xml(source
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("Media"));
         write!(
             out,
-            "<asset id=\"{id}\" name=\"{name}\" start=\"{}\" duration=\"{}\"",
+            "<asset id=\"{id}\" name=\"{}\" start=\"{}\" duration=\"{}\"",
+            file_name(source, "Media"),
             seconds(info.start_time),
             if *still {
                 "0s".into()
@@ -122,112 +257,129 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
         xml(&edit.name),
         edit.fps.fcpxml(edit.duration_frames)
     )?;
-    // A full-length gap anchors the video storyline and independent audio lanes.
-    // External audio placement remains independent of a retimed first shot.
+    // A full-length gap anchors every track as a connected storyline, so no
+    // track's placement depends on another track's retiming.
     writeln!(
         out,
-        "<gap name=\"Skywrite assembly\" offset=\"0s\" start=\"0s\" duration=\"{}\">",
+        "<gap name=\"Skywrite timeline\" offset=\"0s\" start=\"0s\" duration=\"{}\">",
         edit.fps.fcpxml(edit.duration_frames)
     )?;
-    if !edit.captions.is_empty() {
-        writeln!(
-            out,
-            "<note>{}</note>",
-            xml(&serde_json::to_string(
-                &serde_json::json!({"caption_tracks":edit.captions,"usage":"Caption cues preserved as plain data; import captions separately. Burn mode is not applied by FCPXML."})
-            )?)
-        )?;
-    }
-    writeln!(out, "<spine lane=\"1\" offset=\"0s\">")?;
-    for clip in &edit.clips {
-        let duration = edit.fps.fcpxml(clip.duration_frames);
-        let offset = edit.fps.fcpxml(clip.offset_frames);
-        if clip.kind == MediaKind::Gap {
+    // Native FCPXML captions, connected above every video track, one lane per
+    // caption track. Burn mode is a render setting and is not represented.
+    let caption_base = edit.video_tracks().len() + 1;
+    let mut style = 0usize;
+    for (index, track) in edit.captions.iter().enumerate() {
+        let role = format!("SRT?captionFormat=SRT.{}", two_letter(&track.language));
+        for cue in &track.cues {
+            style += 1;
             writeln!(
                 out,
-                "<gap name=\"Gap\" offset=\"{offset}\" start=\"0s\" duration=\"{duration}\"/>"
+                "<caption lane=\"{}\" offset=\"{}\" name=\"{}\" start=\"0s\" duration=\"{}\" role=\"{}\"><text placement=\"bottom\"><text-style ref=\"cts{style}\">{}</text-style></text><text-style-def id=\"cts{style}\"><text-style font=\"Helvetica\" fontSize=\"13\" fontFace=\"Regular\" fontColor=\"1 1 1 1\" backgroundColor=\"0 0 0 1\"/></text-style-def></caption>",
+                caption_base + index,
+                seconds(cue.start),
+                xml(&cue.text.chars().take(40).collect::<String>()),
+                seconds(cue.end - cue.start),
+                xml(&role),
+                xml(&cue.text)
             )?;
+        }
+    }
+    for (t, track) in edit.video_tracks().iter().enumerate() {
+        if track.clips.is_empty() {
             continue;
         }
-        let source = clip.source.as_ref().context("validated source missing")?;
-        let info = clip.media.as_ref().context("validated media missing")?;
-        let start = info.start_time + clip.source_in;
-        let local_start = if clip.speed == 1.0 { start } else { 0.0 };
-        let tag = if clip.kind == MediaKind::Image {
-            "video"
-        } else {
-            "asset-clip"
-        };
-        write!(
-            out,
-            "<{tag} ref=\"{}\" name=\"{}\" offset=\"{offset}\" start=\"{}\" duration=\"{duration}\"",
-            assets[source],
-            xml(source
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("Clip")),
-            seconds(local_start)
-        )?;
-        if tag == "asset-clip" && clip.volume == 0.0 {
-            write!(out, " srcEnable=\"video\"")?;
-        }
-        writeln!(out, ">")?;
-        if clip.speed != 1.0 {
-            time_map(
-                &mut out,
-                start,
-                edit.fps.seconds(clip.duration_frames),
-                clip.speed,
-            )?;
-        }
-        if clip.volume > 0.0 && clip.volume != 1.0 && info.has_audio() {
-            writeln!(
-                out,
-                "<adjust-volume amount=\"{:.6}dB\"/>",
-                20.0 * clip.volume.log10()
-            )?;
-        }
-        writeln!(out, "</{tag}>")?;
-    }
-    writeln!(out, "</spine>")?;
-    for (index, clip) in edit.audio.iter().enumerate() {
-        let start = clip.media.start_time + clip.source_in;
-        let local_start = if clip.speed == 1.0 { start } else { 0.0 };
         writeln!(
             out,
-            "<asset-clip ref=\"{}\" lane=\"-{}\" name=\"{}\" offset=\"{}\" start=\"{}\" duration=\"{}\" audioRole=\"dialogue\" srcEnable=\"audio\"{}>",
-            assets[&clip.source],
-            index + 1,
-            xml(clip
-                .source
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("Audio")),
-            edit.fps.fcpxml(clip.offset_frames),
-            seconds(local_start),
-            edit.fps.fcpxml(clip.duration_frames),
-            if clip.volume == 0.0 {
-                " enabled=\"0\""
-            } else {
-                ""
-            }
+            "<spine lane=\"{}\" offset=\"0s\" name=\"{}\">",
+            t + 1,
+            xml(&track.name)
         )?;
-        if clip.speed != 1.0 {
-            time_map(
-                &mut out,
-                start,
-                edit.fps.seconds(clip.duration_frames),
-                clip.speed,
+        let mut cursor = 0;
+        for clip in &track.clips {
+            gap(&mut out, edit, cursor, clip.start_frames)?;
+            cursor = clip.end_frames();
+            let duration = edit.fps.seconds(clip.duration_frames);
+            let start = clip.media.start_time + clip.source_in;
+            let local_start = if clip.speed == 1.0 && clip.kind == MediaKind::Video {
+                start
+            } else {
+                0.0
+            };
+            let tag = if clip.kind == MediaKind::Image {
+                "video"
+            } else {
+                "asset-clip"
+            };
+            write!(
+                out,
+                "<{tag} ref=\"{}\" name=\"{}\" offset=\"{}\" start=\"{}\" duration=\"{}\"",
+                assets[&clip.source],
+                file_name(&clip.source, "Clip"),
+                edit.fps.fcpxml(clip.start_frames),
+                seconds(local_start),
+                edit.fps.fcpxml(clip.duration_frames)
             )?;
+            if tag == "asset-clip" && !clip.has_audible_sound() {
+                write!(out, " srcEnable=\"video\"")?;
+            } else if let (true, Some(role)) = (tag == "asset-clip", track.role) {
+                write!(out, " audioRole=\"{}\"", role.as_str())?;
+            }
+            writeln!(out, ">")?;
+            if clip.speed != 1.0 {
+                time_map(&mut out, start, duration, clip.speed)?;
+            }
+            blend(&mut out, clip, local_start, duration)?;
+            if clip.has_audible_sound() {
+                volume(&mut out, &clip.audio, local_start)?;
+            }
+            writeln!(out, "</{tag}>")?;
         }
-        if clip.volume > 0.0 && clip.volume != 1.0 {
+        writeln!(out, "</spine>")?;
+    }
+    for (t, track) in edit.audio_tracks().iter().enumerate() {
+        if track.clips.is_empty() {
+            continue;
+        }
+        writeln!(
+            out,
+            "<spine lane=\"-{}\" offset=\"0s\" name=\"{}\">",
+            t + 1,
+            xml(&track.name)
+        )?;
+        let mut cursor = 0;
+        for clip in &track.clips {
+            gap(&mut out, edit, cursor, clip.start_frames)?;
+            cursor = clip.end_frames();
+            let start = clip.media.start_time + clip.source_in;
+            let local_start = if clip.speed == 1.0 { start } else { 0.0 };
             writeln!(
                 out,
-                "<adjust-volume amount=\"{:.6}dB\"/>",
-                20.0 * clip.volume.log10()
+                "<asset-clip ref=\"{}\" name=\"{}\" offset=\"{}\" start=\"{}\" duration=\"{}\" audioRole=\"{}\" srcEnable=\"audio\"{}>",
+                assets[&clip.source],
+                file_name(&clip.source, "Audio"),
+                edit.fps.fcpxml(clip.start_frames),
+                seconds(local_start),
+                edit.fps.fcpxml(clip.duration_frames),
+                // FCP's default audio role is dialogue; a declared role wins.
+                track.role.map_or("dialogue", |r| r.as_str()),
+                if clip.mix.audible() {
+                    ""
+                } else {
+                    " enabled=\"0\""
+                }
             )?;
+            if clip.speed != 1.0 {
+                time_map(
+                    &mut out,
+                    start,
+                    edit.fps.seconds(clip.duration_frames),
+                    clip.speed,
+                )?;
+            }
+            volume(&mut out, &clip.mix, local_start)?;
+            writeln!(out, "</asset-clip>")?;
         }
-        writeln!(out, "</asset-clip>")?;
+        writeln!(out, "</spine>")?;
     }
     for chapter in &edit.chapters {
         writeln!(

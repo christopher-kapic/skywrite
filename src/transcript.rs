@@ -15,6 +15,10 @@ pub struct Word {
     pub end: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+    /// Set only when the word's audio was near silent (a possible
+    /// recognition hallucination); measured by Skywrite, not the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_level_dbfs: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transcript {
@@ -299,6 +303,7 @@ fn transcribe_with_limits(
     let mut texts = Vec::new();
     let mut usages = Vec::new();
     let mut cache_hits = 0;
+    let mut low_audio_count = 0usize;
     let mut provider_reordered_chunks = 0;
     let chunks = (duration / options.chunk_seconds).ceil() as usize;
     // Reserve counters at their largest possible decimal width and the longer
@@ -311,16 +316,24 @@ fn transcribe_with_limits(
         words: Vec::new(),
         model: Some(options.model.to_owned()),
         usage: Some(
-            json!({"chunks":[],"cache_hits":chunks,"total_chunks":chunks,"source_sha256":source_sha256,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":chunks,"chunk_boundary_reordered":false}}),
+            json!({"chunks":[],"cache_hits":chunks,"total_chunks":chunks,"source_sha256":source_sha256,"low_audio_words":max_words,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":chunks,"chunk_boundary_reordered":false}}),
         ),
     };
     let mut budget = TranscriptBudget::new(json_size(&baseline, 0)? + 1, max_bytes, max_words)?;
+    if let Some(language) = options.language
+        && options.model.contains("whisper")
+    {
+        eprintln!(
+            "Warning: with --language {language}, Whisper writes speech in any other language translated into {language}. Omit --language for multilingual footage."
+        );
+    }
     for index in 0..chunks {
         let offset = options.start + index as f64 * options.chunk_seconds;
         let length = (options.start + duration - offset).min(options.chunk_seconds);
         let audio_path = temp.path().join(format!("chunk-{index:05}.wav"));
         crate::media::extract_audio(info, &audio_path, offset, length)?;
         let bytes = std::fs::read(&audio_path)?;
+        let chunk_audio = wav_samples(&bytes);
         // Each WAV is only needed until it has been encoded for this request.
         std::fs::remove_file(&audio_path).context("removing processed audio chunk")?;
         if bytes.len() > 4 * 1024 * 1024 {
@@ -351,6 +364,27 @@ fn transcribe_with_limits(
                 "Transcription chunk {}: reordered provider words chronologically; original timestamps and text preserved",
                 index + 1
             );
+        }
+        // Flag (never drop) words placed where the audio is near silent: a
+        // common sign of recognition hallucination on ambient audio. Quiet
+        // recordings are judged against their own typical word level.
+        if let Some((rate, samples)) = &chunk_audio {
+            let levels: Vec<Option<f64>> = chunk_words
+                .iter()
+                .map(|w| level_dbfs(samples, *rate, w.start, w.end))
+                .collect();
+            let mut sorted: Vec<f64> = levels.iter().flatten().copied().collect();
+            sorted.sort_by(f64::total_cmp);
+            let median = sorted.get(sorted.len() / 2).copied();
+            for (word, level) in chunk_words.iter_mut().zip(levels) {
+                if let Some(level) = level
+                    && (level < SILENT_DBFS
+                        || median.is_some_and(|m| level < m - RELATIVE_SILENCE_DB))
+                {
+                    low_audio_count += 1;
+                    word.audio_level_dbfs = Some((level * 10.0).round() / 10.0);
+                }
+            }
         }
         for word in &mut chunk_words {
             word.start += offset;
@@ -389,12 +423,63 @@ fn transcribe_with_limits(
         words,
         model: Some(options.model.to_owned()),
         usage: Some(
-            json!({"chunks":usages,"cache_hits":cache_hits,"total_chunks":chunks,"source_sha256":source_sha256,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":provider_reordered_chunks,"chunk_boundary_reordered":chunk_boundary_reordered}}),
+            json!({"chunks":usages,"cache_hits":cache_hits,"total_chunks":chunks,"source_sha256":source_sha256,
+                "low_audio_words":low_audio_count,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":provider_reordered_chunks,"chunk_boundary_reordered":chunk_boundary_reordered}}),
         ),
     };
     transcript.validate()?;
     Ok(transcript)
 }
+const SILENT_DBFS: f64 = -75.0;
+const RELATIVE_SILENCE_DB: f64 = 30.0;
+
+/// Mono 16-bit PCM samples from a WAV produced by `media::extract_audio`.
+fn wav_samples(bytes: &[u8]) -> Option<(u32, Vec<i16>)> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let (mut at, mut rate, mut channels, mut bits) = (12usize, 0u32, 0u16, 0u16);
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = bytes.get(at + 8..(at + 8).checked_add(size)?.min(bytes.len()))?;
+        if id == b"fmt " && body.len() >= 16 {
+            channels = u16::from_le_bytes([body[2], body[3]]);
+            rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+            bits = u16::from_le_bytes([body[14], body[15]]);
+        } else if id == b"data" {
+            if channels != 1 || bits != 16 || rate == 0 {
+                return None;
+            }
+            let samples = body
+                .chunks_exact(2)
+                .map(|v| i16::from_le_bytes([v[0], v[1]]))
+                .collect();
+            return Some((rate, samples));
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
+}
+
+fn level_dbfs(samples: &[i16], rate: u32, start: f64, end: f64) -> Option<f64> {
+    // Measure at least 50 ms so zero-length words still get a level.
+    let middle = (start + end) / 2.0;
+    let half = ((end - start) / 2.0).max(0.025);
+    let from = (((middle - half) * rate as f64).max(0.0)) as usize;
+    let to = (((middle + half) * rate as f64) as usize).min(samples.len());
+    if to <= from {
+        return None;
+    }
+    let window = &samples[from..to];
+    let mean = window
+        .iter()
+        .map(|s| (*s as f64 / 32768.0).powi(2))
+        .sum::<f64>()
+        / window.len() as f64;
+    Some(10.0 * mean.max(1e-12).log10())
+}
+
 fn parse_response(response: &Value, duration: f64) -> Result<(String, Vec<Word>, bool)> {
     let text = response["text"]
         .as_str()
@@ -416,6 +501,15 @@ fn parse_response(response: &Value, duration: f64) -> Result<(String, Vec<Word>,
             bail!("transcript exceeds one million words");
         }
         for value in raw_words {
+            // Some providers interleave non-speech entries ("[laughs]" audio
+            // events, spacing). Only spoken words become transcript words.
+            if value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "word")
+            {
+                continue;
+            }
             let word: Word =
                 serde_json::from_value(value.clone()).context("invalid provider word timestamp")?;
             validate_word(&word, duration)?;
@@ -442,6 +536,19 @@ mod tests {
         assert!(parse_response(&json!({"text":"","words":[]}), 1.0).is_ok());
         assert!(parse_response(&json!({"text":"","words":null}), 1.0).is_err());
         assert!(parse_response(&json!({"text":"","words":{"word":"hidden"}}), 1.0).is_err());
+        let (_, words, _) = parse_response(
+            &json!({"text":"ha [laughs] yes","words":[
+            {"word":"ha","start":0.1,"end":0.2,"type":"word"},
+            {"word":" ","start":0.2,"end":0.3,"type":"spacing"},
+            {"word":"[laughs]","start":0.3,"end":0.6,"type":"audio_event"},
+            {"word":"yes","start":0.7,"end":0.9}]}),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(
+            words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            ["ha", "yes"]
+        );
     }
     #[test]
     fn provider_overlap_and_equal_starts_preserve_all_words_and_text() {
@@ -476,6 +583,31 @@ mod tests {
     }
 
     #[test]
+    fn silent_words_are_measured_from_chunk_audio() {
+        let rate = 16_000u32;
+        let mut samples = vec![0i16; rate as usize];
+        for (i, sample) in samples.iter_mut().enumerate().skip(rate as usize / 2) {
+            *sample = ((i as f64 * 0.2).sin() * 8000.0) as i16;
+        }
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(rate.to_le_bytes());
+        wav.extend((rate * 2).to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((samples.len() as u32 * 2).to_le_bytes());
+        samples.iter().for_each(|s| wav.extend(s.to_le_bytes()));
+        let (parsed_rate, parsed) = wav_samples(&wav).unwrap();
+        assert_eq!((parsed_rate, parsed.len()), (rate, samples.len()));
+        assert!(level_dbfs(&parsed, rate, 0.1, 0.3).unwrap() < SILENT_DBFS);
+        assert!(level_dbfs(&parsed, rate, 0.7, 0.9).unwrap() > -20.0);
+        assert!(wav_samples(b"not a wav").is_none());
+    }
+
+    #[test]
     fn provider_rejects_invalid_words_instead_of_dropping_or_clamping() {
         for word in [
             json!({"word":"negative","start":-0.1,"end":0.2}),
@@ -501,6 +633,7 @@ mod tests {
             start: 0.1,
             end: 0.2,
             confidence: None,
+            audio_level_dbfs: None,
         };
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             word.start = invalid;
@@ -530,6 +663,7 @@ mod tests {
             start: 86400.14,
             end: 86400.15,
             confidence: Some(0.9),
+            audio_level_dbfs: None,
         };
         let usage = json!({"deep":[{"nested":[1,2,{"x":"\n"}]}]});
         let mut budget = TranscriptBudget::new(base, 4096, 3).unwrap();

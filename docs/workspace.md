@@ -38,6 +38,12 @@ The files remain editable using an ordinary text editor. Generation and upscalin
 steps in the outlines require checking the installed CLI's current capabilities.
 
 Every frustration should be recorded explicitly with `skywrite nit DESCRIPTION`.
+When Skywrite cannot decode or verify something (undecodable camera color labels,
+an unsupported container, an NLE import you could not check), make the nit
+actionable: include the raw `skywrite inspect` or command output, the camera or
+application and the settings the operator confirmed, and the relevant source file
+from https://github.com/christopher-kapic/skywrite (for example `src/color.rs` or
+`src/export/xmeml.rs`).
 Each call creates a unique JSON file, containing only the supplied description,
 application version, schema version, and a Unix creation timestamp. Descriptions
 must be nonempty, at most 8192 bytes, and contain no NUL. There is no automatic

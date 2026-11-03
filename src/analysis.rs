@@ -334,6 +334,14 @@ pub fn suggestion_context(analyses: &[Analysis]) -> Result<Value> {
     Ok(context)
 }
 
+/// The exact edit-suggestion request text; the response cache key depends on it.
+pub fn suggest_prompt(brief: &str, edit_schema: &Value, analyses: &str) -> String {
+    format!(
+        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Use verified transcript word spans to keep spoken words intact when selecting dialogue. Intentional B-roll and J/L cuts remain valid. Prefer complete thoughts and purposeful cuts. Place every clip at an explicit timeline start; empty timeline is black and silent. Put continuous dialogue on video track 0 or an audio track and B-roll on video track 1 above it (mute B-roll sound with audio.volume 0 when the dialogue continues underneath). Return ONLY an edit JSON object with \"version\": 2 conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize starts and durations to the requested frame grid. Clips on one track must not overlap. No titles, LUTs, source settings or unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
+        edit_schema, analyses
+    )
+}
+
 /// Advisory review for audible cuts only; never rejects deliberate edits.
 pub fn dialogue_cut_warnings(
     edit: &crate::timeline::ValidatedEdit,
@@ -349,39 +357,28 @@ pub fn dialogue_cut_warnings(
         speed: f64,
         volume: f64,
     }
-    let mut spans = Vec::new();
-    for (i, clip) in edit.clips.iter().enumerate() {
-        if clip.volume > 0.0 && clip.media.as_ref().is_some_and(|m| m.has_audio()) {
-            let duration = edit.fps.seconds(clip.duration_frames);
-            let offset = edit.fps.seconds(clip.offset_frames);
-            spans.push(Span {
-                label: format!("clip {i}"),
-                source: clip.source.as_deref().unwrap(),
-                first: clip.source_in,
-                last: clip.source_in + duration * clip.speed,
-                offset,
-                end: offset + duration,
-                speed: clip.speed,
-                volume: clip.volume,
-            });
-        }
-    }
-    for (i, clip) in edit.audio.iter().enumerate() {
-        if clip.volume > 0.0 {
-            let duration = edit.fps.seconds(clip.duration_frames);
-            let offset = edit.fps.seconds(clip.offset_frames);
-            spans.push(Span {
-                label: format!("audio {i}"),
-                source: &clip.source,
-                first: clip.source_in,
-                last: clip.source_in + duration * clip.speed,
-                offset,
-                end: offset + duration,
-                speed: clip.speed,
-                volume: clip.volume,
-            });
-        }
-    }
+    let spans = edit
+        .audible_spans()
+        .into_iter()
+        .map(|span| Span {
+            label: span.label,
+            source: span.source,
+            first: span.source_in,
+            last: span.source_in + span.duration * span.speed,
+            offset: span.start,
+            end: span.start + span.duration,
+            speed: span.speed,
+            // A cut is only continuous when the gain carries on unchanged.
+            volume: if span.mix.keyframes.is_empty()
+                && span.mix.fade_in == 0.0
+                && span.mix.fade_out == 0.0
+            {
+                span.mix.volume
+            } else {
+                f64::NAN
+            },
+        })
+        .collect::<Vec<_>>();
     let near = |a: f64, b: f64| (a - b).abs() <= 1e-6;
     let mut warnings = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -925,34 +922,36 @@ mod dialogue_tests {
         words[2].end = 1.6;
         let source = report.media.path.clone();
         let validate = |audio: Value| {
-            let edit: crate::timeline::Edit = serde_json::from_value(
-                json!({"clips":[{"source":null,"duration":1.0}],"audio":audio}),
+            let edit = crate::timeline::parse(
+                json!({"version":2,"duration":1.0,"audio":[{"clips":audio}]}),
             )
             .unwrap();
             crate::timeline::validate(&edit, dir.path()).unwrap()
         };
-        let unsafe_edit = validate(json!([{"source":source,"source_in":1.4,"duration":0.1}]));
+        let unsafe_edit =
+            validate(json!([{"start":0,"source":source,"source_in":1.4,"duration":0.1}]));
         assert_eq!(
             dialogue_cut_warnings(&unsafe_edit, std::slice::from_ref(&report))
                 .unwrap()
                 .len(),
             2
         );
-        let safe = validate(json!([{"source":source,"source_in":1.3,"duration":0.3}]));
+        let safe = validate(json!([{"start":0,"source":source,"source_in":1.3,"duration":0.3}]));
         assert!(
             dialogue_cut_warnings(&safe, std::slice::from_ref(&report))
                 .unwrap()
                 .is_empty()
         );
-        let muted =
-            validate(json!([{"source":source,"source_in":1.4,"duration":0.1,"volume":0.0}]));
+        let muted = validate(
+            json!([{"start":0,"source":source,"source_in":1.4,"duration":0.1,"volume":0.0}]),
+        );
         assert!(
             dialogue_cut_warnings(&muted, std::slice::from_ref(&report))
                 .unwrap()
                 .is_empty()
         );
         let contiguous = validate(
-            json!([{"source":source,"source_in":1.3,"duration":0.1},{"source":source,"source_in":1.4,"duration":0.2,"offset":0.1}]),
+            json!([{"start":0,"source":source,"source_in":1.3,"duration":0.1},{"start":0.1,"source":source,"source_in":1.4,"duration":0.2}]),
         );
         assert!(
             dialogue_cut_warnings(&contiguous, std::slice::from_ref(&report))
@@ -987,8 +986,8 @@ mod dialogue_tests {
         report.transcript.as_mut().unwrap().source = video.clone();
         report.transcript.as_mut().unwrap().usage =
             Some(json!({"source_sha256":report.source_sha256}));
-        let edit: crate::timeline::Edit = serde_json::from_value(
-            json!({"clips":[{"source":video,"source_in":1.4,"duration":1.0,"volume":0.0}]}),
+        let edit = crate::timeline::parse(
+            json!({"version":2,"video":[{"clips":[{"start":0,"source":video,"source_in":1.4,"duration":1.0,"audio":{"volume":0.0}}]}]}),
         )
         .unwrap();
         let muted_broll = crate::timeline::validate(&edit, dir.path()).unwrap();
@@ -997,8 +996,8 @@ mod dialogue_tests {
                 .unwrap()
                 .is_empty()
         );
-        let edit: crate::timeline::Edit = serde_json::from_value(
-            json!({"clips":[{"source":video,"source_in":1.4,"duration":0.1}]}),
+        let edit = crate::timeline::parse(
+            json!({"version":2,"video":[{"clips":[{"start":0,"source":video,"source_in":1.4,"duration":0.1}]}]}),
         )
         .unwrap();
         let audible = crate::timeline::validate(&edit, dir.path()).unwrap();
@@ -1008,7 +1007,7 @@ mod dialogue_tests {
                 .len(),
             2
         );
-        let edit: crate::timeline::Edit = serde_json::from_value(json!({"clips":[{"source":video,"source_in":1.3,"duration":0.1},{"source":video,"source_in":1.4,"duration":0.2}]})).unwrap();
+        let edit = crate::timeline::parse(json!({"version":2,"video":[{"clips":[{"start":0,"source":video,"source_in":1.3,"duration":0.1},{"start":0.1,"source":video,"source_in":1.4,"duration":0.2}]}]})).unwrap();
         let continuous_picture_cuts = crate::timeline::validate(&edit, dir.path()).unwrap();
         assert!(
             dialogue_cut_warnings(&continuous_picture_cuts, &[report])

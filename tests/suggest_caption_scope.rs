@@ -50,17 +50,14 @@ fn cached_caption_paths_require_explicit_authority_before_validation() {
     assert!(!encoded.contains("DO NOT USE UNBOUNDED SUMMARY"));
     assert!(!encoded.contains("outside"));
     let brief = "Preserve supplied word precision with separate dialogue audio";
-    let prompt = format!(
-        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Use verified transcript word spans to keep spoken words intact when selecting dialogue. Intentional B-roll and J/L cuts remain valid. Prefer complete thoughts and purposeful cuts. You can include black gaps with source:null and separate audio overlays. Return ONLY an edit JSON object conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Output duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize durations and offsets to the requested frame grid. No titles/effects/unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
-        schema["edit"], encoded
-    );
+    let prompt = skywrite::analysis::suggest_prompt(brief, &schema["edit"], &encoded);
     let request = json!({"model":"fixture/dialogue","messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2});
     let key = skywrite::openrouter::cache_key(&[
         b"https://openrouter.ai/api/v1",
         b"chat/completions",
         &serde_json::to_vec(&request).unwrap(),
     ]);
-    let draft = json!({"version":1,"name":"Supplied word","width":64,"height":64,"fps":{"num":30,"den":1},"clips":[{"source":null,"duration":1.0}],"audio":[{"source":source,"source_in":1.300123,"duration":0.5,"offset":0.0,"speed":1.0,"volume":1.0}]});
+    let draft = json!({"version":2,"name":"Supplied word","width":64,"height":64,"fps":{"num":30,"den":1},"duration":1.0,"audio":[{"clips":[{"start":0.0,"source":source,"source_in":1.300123,"duration":0.5,"speed":1.0,"volume":1.0}]}]});
     let cache = dir.path().join("cache/responses");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(
@@ -97,8 +94,8 @@ fn cached_caption_paths_require_explicit_authority_before_validation() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["audio"][0]["source_in"], 1.300123);
-    assert_eq!(result["audio"][0]["duration"], 0.5);
+    assert_eq!(result["audio"][0]["clips"][0]["source_in"], 1.300123);
+    assert_eq!(result["audio"][0]["clips"][0]["duration"], 0.5);
     assert!(String::from_utf8_lossy(&output.stderr).contains("\"cached\":true"));
     assert_eq!(std::fs::read(&source).unwrap(), source_before);
     let loaded = skywrite::timeline::load_and_validate(&output_path).unwrap();
@@ -113,7 +110,7 @@ fn cached_caption_paths_require_explicit_authority_before_validation() {
         ("authorized", &transcript_path, true),
     ] {
         let mut next = draft.clone();
-        next["clips"][0]["duration"] = json!(4.0);
+        next["duration"] = json!(4.0);
         next["captions"] = json!([{"source":caption}]);
         // This unauthorized file is valid: removing the guard would accept it.
         let edit: skywrite::timeline::Edit = serde_json::from_value(next.clone()).unwrap();

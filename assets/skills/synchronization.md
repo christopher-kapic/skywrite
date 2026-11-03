@@ -20,7 +20,7 @@ jq --argjson start 10 --argjson end 30 '[.words[] | select(.start < $end and (.e
 
 Keep words crossing either boundary; do not clamp their timestamps to the queried range. Choose complete thoughts inside the observed range or request a wider range. Use original starts/ends in playback seconds, including fractional precision. Container timecode and uniformly sampled frame seeks are separate concepts and cannot replace word alignment. A transcript is provider alignment evidence; listen around a cut before accepting it. An untranscribed interval is not proof of silence.
 
-For audible speech, preserve the entire word span. `source_in` supports subframe precision; output `duration` and audio `offset` follow the sequence frame grid. At speed `s`, source out is `source_in + duration*s`; round output duration outward when necessary to retain the last word. Do not round a word's start upward or end downward and call the remaining syllable a complete word.
+For audible speech, preserve the entire word span. `source_in` supports subframe precision; clip `start` and output `duration` follow the sequence frame grid. At speed `s`, source out is `source_in + duration*s`; round output duration outward when necessary to retain the last word. Do not round a word's start upward or end downward and call the remaining syllable a complete word.
 
 Muted B-roll can change picture during a spoken word. Intentional J/L cuts can carry a complete dialogue span on a separate audio overlay while the picture changes. Do not enforce a blanket ban on visual midword cuts. No tool should silently transcribe, regenerate narration, or submit a paid retake to solve a cut.
 

@@ -56,7 +56,7 @@ fn offline_init_is_idempotent_and_preserves_preferences_and_unknown_fields() {
     );
     let initialized = run(root, &["init"]);
     assert_eq!(initialized["created"], true);
-    assert_eq!(initialized["model_defaults"].as_object().unwrap().len(), 8);
+    assert_eq!(initialized["model_defaults"].as_object().unwrap().len(), 10);
     let config_path = root.join("personal/config.json");
     let first = fs::read(&config_path).unwrap();
     assert_eq!(run(root, &["init"])["changed"], false);
@@ -88,14 +88,14 @@ fn task_aliases_default_setters_and_real_dry_run_share_selection() {
     let root = temp.path();
     assert_eq!(run(root, &["defaults", "image"])["model"], Value::Null);
     let fallback = run(root, &["defaults", "transcription"]);
-    assert_eq!(fallback["model"], "openai/whisper-large-v3");
+    assert_eq!(fallback["model"], "elevenlabs/scribe-v2");
     assert_eq!(fallback["source"], "builtin");
     assert_eq!(
         run(root, &["defaults"])["defaults"]
             .as_array()
             .unwrap()
             .len(),
-        9
+        11
     );
     let saved = run(root, &["default", "image", "set", "test/saved"]);
     assert_eq!(saved["task"], "image-generation");
@@ -327,7 +327,7 @@ fn concurrent_init_and_setters_use_one_lock_without_losing_choices() {
     ] {
         assert_eq!(saved["model_defaults"][task], model);
     }
-    assert_eq!(saved["model_defaults"].as_object().unwrap().len(), 8);
+    assert_eq!(saved["model_defaults"].as_object().unwrap().len(), 10);
 }
 
 #[test]

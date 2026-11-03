@@ -1550,7 +1550,7 @@ fn publish(dir: &Path, job: &Job, output: &Path, overwrite: bool) -> Result<()> 
     if overwrite {
         temp.persist(output).map_err(|e| e.error)?;
     } else {
-        temp.persist_noclobber(output).map_err(|e| e.error)?;
+        crate::io::persist_new(temp, output)?;
     }
     sync_directory_chain(parent)?;
     Ok(())
@@ -1955,7 +1955,7 @@ fn resize_image(input: &Path, output: &Path, factor: f64, overwrite: bool) -> Re
     if overwrite {
         temp.persist(output).map_err(|e| e.error)?;
     } else {
-        temp.persist_noclobber(output).map_err(|e| e.error)?;
+        crate::io::persist_new(temp, output)?;
     }
     Ok(
         json!({"input":input,"output":output,"width":width,"height":height,"factor":factor,"method":"ffmpeg-lanczos","ai":false,"paid_request":false,"sha256":crate::media::file_sha256(output)?}),
@@ -2103,7 +2103,7 @@ fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool)
     if overwrite {
         temp.persist(output).map_err(|e| e.error)?;
     } else {
-        temp.persist_noclobber(output).map_err(|e| e.error)?;
+        crate::io::persist_new(temp, output)?;
     }
     sync_directory_chain(parent)?;
     Ok(())

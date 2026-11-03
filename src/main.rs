@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -10,7 +10,7 @@ use std::time::Duration;
     name = "skywrite",
     version,
     about = "Agent-friendly media understanding, synchronization, and editing",
-    after_help = "Run skywrite init for offline starter preferences and skywrite defaults image to inspect a task. All successful commands emit JSON to stdout. Diagnostics go to stderr. Agents: save ALL frustrations, bugs, and missing features with skywrite nit <description>. Run skywrite schema for edit/transcript examples. Compose tools: render HTML graphics as image clips in FCPXML/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation."
+    after_help = "All successful commands emit JSON to stdout; diagnostics go to stderr. Start with skywrite init, then skywrite schema for the layered edit format.\n\nBefore creative choices (music, B-roll, pacing, color), check skywrite styles list for the user's saved preferences; ask the user when none apply.\n\nChoosing cuts: transcribe for word timestamps, survey with skywrite describe frames SOURCE --every 30, then focus in around each candidate with --around TIME --window 1 (or skywrite review sheet). Audition with skywrite review cuts and check with skywrite review lint.\n\nCompose tools: render HTML graphics as image clips on upper video tracks in FCPXML/Premiere/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation.\n\nAgents: record ALL frustrations, bugs and missing features with skywrite nit <description>. When Skywrite cannot decode or verify something (camera color metadata, an unsupported format, an NLE import you could not check), include the raw inspect/command output, the camera or app and its operator-confirmed settings, and the relevant source file from https://github.com/christopher-kapic/skywrite (for example src/color.rs or src/export/xmeml.rs)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,7 +66,7 @@ enum Command {
         #[command(subcommand)]
         command: skywrite::workspace::ContentCommand,
     },
-    /// Save ALL agent frustrations in ~/.skywrite/nits (never uploads).
+    /// Save ALL agent frustrations in ~/.skywrite/nits (never uploads). Include raw output and source file references when something could not be decoded or verified.
     Nit { description: String },
     /// Generate images, videos, narrated speech, or music with durable job records.
     Generate {
@@ -78,7 +78,7 @@ enum Command {
         #[command(subcommand)]
         command: skywrite::generation::JobsCommand,
     },
-    /// Convert word-timed transcripts or mux optional subtitle tracks.
+    /// Captions: SRT is the default deliverable (editable as text in NLEs); burn-in or image captions only on request.
     Captions {
         #[command(subcommand)]
         command: CaptionsCommand,
@@ -108,6 +108,16 @@ enum Command {
     Outputs {
         #[command(subcommand)]
         command: skywrite::outputs::OutputsCommand,
+    },
+    /// Model descriptions of exact frames (cached per frame) or short video ranges.
+    Describe {
+        #[command(subcommand)]
+        command: skywrite::describe::DescribeCommand,
+    },
+    /// Review aids: exact-frame contact sheets, cut audition clips, and objective edit checks.
+    Review {
+        #[command(subcommand)]
+        command: skywrite::review::ReviewCommand,
     },
     /// Print agent-facing edit and transcript schemas/examples.
     Schema,
@@ -200,6 +210,10 @@ struct TranscribeArgs {
     input: PathBuf,
     #[arg(long)]
     model: Option<String>,
+    /// Hint the spoken language (ISO code). Only use it when ALL speech is in this
+    /// language: Whisper models write other-language speech translated into the
+    /// hint (Spanish "con la mano" became "With my hand" under --language en).
+    /// Omit it for bilingual footage.
     #[arg(long)]
     language: Option<String>,
     #[arg(long, default_value_t = 0.0)]
@@ -244,24 +258,59 @@ struct SyncArgs {
 }
 #[derive(Subcommand)]
 enum EditCommand {
-    Validate {
+    /// Check sources, ranges, layers and frame rounding without rendering.
+    Validate { file: PathBuf },
+    /// Write an edit's caption track (output-timeline cues) as SRT or VTT for an NLE.
+    Captions {
         file: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Caption track index in the edit.
+        #[arg(long, default_value_t = 0)]
+        track: usize,
+        #[arg(long, value_parser = ["srt", "vtt"])]
+        format: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
     },
+    /// Read a Premiere/Final Cut Pro 7 XML timeline (or, experimentally, a .prproj) into a version 2 edit.
+    Import {
+        file: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Convert a version 1 edit (sequential clips) to the layered version 2 format.
+    Migrate {
+        file: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Write an NLE interchange (FCPXML, Premiere XML), FFmpeg script, or composition project.
     Export {
         file: PathBuf,
-        #[arg(long,value_parser=["fcpxml","ffmpeg","hyperframes","remotion"])]
+        /// premiere writes Final Cut Pro 7 XML (xmeml v5), which Premiere Pro imports.
+        #[arg(long,value_parser=["fcpxml","premiere","ffmpeg","hyperframes","remotion"])]
         to: String,
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long)]
         overwrite: bool,
     },
+    /// Render an H.264/AAC MP4 with FFmpeg, applying layers, fades, gain, LUTs and limiter.
     Render {
         file: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long)]
         overwrite: bool,
+        /// Keep only the sound of tracks with these roles (for example `--roles dialogue`
+        /// for a dialogue-only check render). Every audible track must declare a role.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        roles: Vec<skywrite::timeline::Role>,
     },
     /// Draft an edit from existing analyses and an editorial brief, then validate it.
     Suggest {
@@ -488,6 +537,8 @@ fn execute(command: Command) -> Result<Value> {
             )
         }
         Command::Verify(args) => skywrite::verify::execute(args),
+        Command::Review { command } => skywrite::review::execute(command),
+        Command::Describe { command } => skywrite::describe::execute(command),
         Command::Inspect {
             inputs,
             exact_audio,
@@ -518,8 +569,14 @@ fn execute(command: Command) -> Result<Value> {
                     } else {
                         "metadata_estimate"
                     };
+                    let color = if info.has_video() {
+                        Some(skywrite::color::report(&info.path, &info.format_name)?)
+                    } else {
+                        None
+                    };
                     let mut value = serde_json::to_value(info)?;
                     value["duration_basis"] = json!(basis);
+                    value["color"] = json!(color);
                     value["audio_timing"] = serde_json::to_value(timing)?;
                     Ok(value)
                 })
@@ -630,6 +687,57 @@ fn execute(command: Command) -> Result<Value> {
             EditCommand::Validate { file } => {
                 Ok(skywrite::timeline::load_and_validate(&file)?.summary())
             }
+            EditCommand::Captions {
+                file,
+                output,
+                track,
+                format,
+                overwrite,
+            } => {
+                skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
+                let edit = skywrite::timeline::load_and_validate(&file)?;
+                skywrite::export::write_caption_track(
+                    &edit,
+                    track,
+                    &output,
+                    format.as_deref(),
+                    overwrite,
+                )
+            }
+            EditCommand::Import {
+                file,
+                output,
+                overwrite,
+            } => {
+                skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
+                let (edit, notes) = skywrite::import::import(&file)?;
+                // Check structure before writing; media may live on another machine.
+                skywrite::timeline::parse(edit.clone())
+                    .context("imported timeline is not a valid edit")?;
+                skywrite::io::write_json(&output, &edit, overwrite)?;
+                let validation = match skywrite::timeline::load_and_validate(&output) {
+                    Ok(validated) => validated.summary(),
+                    Err(error) => {
+                        json!({"valid":false,"error":format!("{error:#}"),"hint":"Media paths are absolute from the exporting machine; fix them or relink, then run skywrite edit validate."})
+                    }
+                };
+                Ok(json!({"input":file,"output":output,"notes":notes,"validation":validation}))
+            }
+            EditCommand::Migrate {
+                file,
+                output,
+                overwrite,
+            } => {
+                skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
+                let old: Value = skywrite::io::read_json(&file)?;
+                let new = skywrite::timeline::migrate_v1(&old)?;
+                skywrite::io::write_json(&output, &new, overwrite)?;
+                Ok(
+                    json!({"input":file,"output":output,"version":skywrite::timeline::EDIT_VERSION,
+                    "next_command":format!("skywrite edit validate {}", output.display()),
+                    "note":"Primary clips are now on video track V1 at explicit start times; overlay audio is packed onto audio tracks. Relative source paths still resolve against the new file's directory."}),
+                )
+            }
             EditCommand::Export {
                 file,
                 to,
@@ -648,13 +756,18 @@ fn execute(command: Command) -> Result<Value> {
                 file,
                 output,
                 overwrite,
+                roles,
             } => {
                 skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
-                skywrite::export::render(
-                    &skywrite::timeline::load_and_validate(&file)?,
-                    &output,
-                    overwrite,
-                )
+                let mut edit = skywrite::timeline::load_and_validate(&file)?;
+                if !roles.is_empty() {
+                    edit = edit.with_roles(&roles)?;
+                }
+                let mut result = skywrite::export::render(&edit, &output, overwrite)?;
+                if !roles.is_empty() {
+                    result["roles"] = json!(roles);
+                }
+                Ok(result)
             }
             EditCommand::Suggest {
                 analysis,
@@ -691,7 +804,7 @@ fn execute(command: Command) -> Result<Value> {
                 cache_dir: cache_dir.as_deref(),
             }),
             ModelCommand::Defaults => Ok(
-                json!({"defaults":skywrite::workspace::model_defaults()?,"task_environment":skywrite::models::TASKS.iter().map(|task|Ok((task.to_string(),skywrite::models::task_environment(task)?))).collect::<Result<std::collections::BTreeMap<_,_>>>()?,"precedence":["--model","task environment (or legacy OPENROUTER_VISION_MODEL for analysis/editing)","saved task default","transcription fallback only: openai/whisper-large-v3"]}),
+                json!({"defaults":skywrite::workspace::model_defaults()?,"task_environment":skywrite::models::TASKS.iter().map(|task|Ok((task.to_string(),skywrite::models::task_environment(task)?))).collect::<Result<std::collections::BTreeMap<_,_>>>()?,"precedence":["--model","task environment (or legacy OPENROUTER_VISION_MODEL for analysis/editing)","saved task default","transcription fallback only: elevenlabs/scribe-v2"]}),
             ),
             ModelCommand::SetDefault { task, model } => {
                 skywrite::workspace::set_default_model(&task, &model)
@@ -795,36 +908,39 @@ fn suggest(
     if encoded.len() > 8 * 1024 * 1024 {
         bail!("combined analysis reports exceed eight MiB; select fewer sources/ranges");
     }
-    let prompt = format!(
-        "Create a coherent, well-paced assembly edit following this brief: {brief}\nUse only the explicitly listed analyzed source paths. Respect source durations; do not invent dialogue or unsampled actions. Use verified transcript word spans to keep spoken words intact when selecting dialogue. Intentional B-roll and J/L cuts remain valid. Prefer complete thoughts and purposeful cuts. You can include black gaps with source:null and separate audio overlays. Return ONLY an edit JSON object conforming to this schema: {}\nAll source paths must be ABSOLUTE paths copied from the analyses. Output duration is timeline seconds; source consumption = duration*speed, so normal speed=1. Quantize durations and offsets to the requested frame grid. No titles/effects/unsupported fields. The default target is 1280x720 at 30/1 fps unless brief requests otherwise. Analyses: {}",
-        schema()["edit"],
-        String::from_utf8(encoded)?
-    );
+    let prompt =
+        skywrite::analysis::suggest_prompt(brief, &schema()["edit"], &String::from_utf8(encoded)?);
     let response=api(options)?.request("chat/completions",&json!({"model":model,"messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2}))?;
     let draft = skywrite::openrouter::assistant_json(&response.body)?;
-    for list in ["clips", "audio", "captions"] {
-        if let Some(clips) = draft[list].as_array() {
-            for clip in clips {
-                if let Some(source) = clip["source"].as_str() {
-                    let path = Path::new(source);
-                    if !path.is_absolute()
-                        || !(if list == "captions" {
-                            &allowed_captions
-                        } else {
-                            &allowed
-                        })
-                        .contains(&skywrite::media::canonical_file(path)?)
-                    {
-                        bail!(
-                            "suggested edit references a source outside the provided analyses/transcripts"
-                        );
-                    }
-                }
+    let mut referenced = Vec::new();
+    for kind in ["video", "audio"] {
+        for track in draft[kind].as_array().into_iter().flatten() {
+            for clip in track["clips"].as_array().into_iter().flatten() {
+                referenced.push((false, clip["source"].clone()));
             }
         }
     }
-    let edit: skywrite::timeline::Edit =
-        serde_json::from_value(draft).context("model produced an invalid edit structure")?;
+    for caption in draft["captions"].as_array().into_iter().flatten() {
+        referenced.push((true, caption["source"].clone()));
+    }
+    ensure!(
+        draft.get("sources").is_none(),
+        "suggested edits must not declare source color settings or LUTs; add them yourself"
+    );
+    for (caption, source) in referenced {
+        let Some(source) = source.as_str() else {
+            bail!("suggested edit has a clip without a string source");
+        };
+        let path = Path::new(source);
+        if !path.is_absolute()
+            || !(if caption { &allowed_captions } else { &allowed })
+                .contains(&skywrite::media::canonical_file(path)?)
+        {
+            bail!("suggested edit references a source outside the provided analyses/transcripts");
+        }
+    }
+    let edit =
+        skywrite::timeline::parse(draft).context("model produced an invalid edit structure")?;
     let base = std::env::current_dir()?;
     let validated = skywrite::timeline::validate(&edit, &base)
         .context("model edit failed validation; no output written")?;
@@ -835,27 +951,75 @@ fn suggest(
     finish(serde_json::to_value(edit)?, output)
 }
 fn schema() -> Value {
-    let clip = json!({"type":"object","additionalProperties":false,"required":["duration"],"properties":{
-        "source":{"type":["string","null"],"description":"Local media path relative to edit file; null creates black/silent gap"},
-        "source_in":{"type":"number","minimum":0,"default":0},
-        "duration":{"type":"number","exclusiveMinimum":0,"maximum":86400,"description":"OUTPUT duration in seconds, on sequence frame grid"},
-        "speed":{"type":"number","minimum":0.125,"maximum":8,"default":1,"description":"Playback multiplier: consumed source seconds = duration * speed"},
-        "volume":{"type":"number","minimum":0,"maximum":4,"default":1}
-    }});
-    let audio = json!({"type":"object","additionalProperties":false,"required":["source","duration"],"properties":{
-        "source":{"type":"string"},"source_in":{"type":"number","minimum":0,"default":0},
-        "offset":{"type":"number","minimum":0,"default":0,"description":"Position on output timeline, in seconds"},
-        "duration":{"type":"number","exclusiveMinimum":0,"maximum":86400},"speed":{"type":"number","minimum":0.125,"maximum":8,"default":1},"volume":{"type":"number","minimum":0,"maximum":4,"default":1}
-    }});
-    let edit = json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Skywrite Edit v1","type":"object","additionalProperties":false,"required":["clips"],"properties":{
-        "version":{"const":1},"name":{"type":"string","default":"Skywrite edit","minLength":1,"maxLength":512,"description":"Nonblank; max 512 UTF-8 bytes; XML controls prohibited"},"width":{"type":"integer","minimum":2,"maximum":8192,"multipleOf":2,"default":1920},"height":{"type":"integer","minimum":2,"maximum":8192,"multipleOf":2,"default":1080},
+    let number = |min: f64, max: f64, default: f64, description: &str| json!({"type":"number","minimum":min,"maximum":max,"default":default,"description":description});
+    let keyframes = json!({"type":"array","maxItems":256,"description":"Linear gain points; time is OUTPUT seconds from the clip start, strictly increasing. Gain interpolates linearly and holds outside the points. Effective gain = volume * envelope * fades.",
+        "items":{"type":"object","additionalProperties":false,"required":["time","volume"],"properties":{"time":{"type":"number","minimum":0},"volume":{"type":"number","minimum":0,"maximum":4}}}});
+    let mix = json!({"type":"object","additionalProperties":false,"properties":{
+        "volume":number(0.0,4.0,1.0,"Linear gain; 0 mutes"),"volume_keyframes":keyframes,
+        "fade_in":number(0.0,86400.0,0.0,"Linear fade-in, output seconds"),"fade_out":number(0.0,86400.0,0.0,"Linear fade-out, output seconds")}});
+    let placement = json!({
+        "start":{"type":"number","minimum":0,"description":"Timeline position in OUTPUT seconds, rounded to the frame grid"},
+        "source":{"type":"string","description":"Local media path relative to the edit file"},
+        "source_in":{"type":"number","minimum":0,"default":0,"description":"Source seconds from the first presented sample"},
+        "duration":{"type":"number","exclusiveMinimum":0,"maximum":86400,"description":"OUTPUT duration in seconds, on the frame grid"},
+        "speed":{"type":"number","minimum":0.125,"maximum":8,"default":1,"description":"Playback multiplier: consumed source seconds = duration * speed"}});
+    let mut video_clip = placement.clone();
+    video_clip["opacity"] = number(
+        0.0,
+        1.0,
+        1.0,
+        "Picture opacity over lower tracks (black at the bottom)",
+    );
+    video_clip["fade_in"] = number(
+        0.0,
+        86400.0,
+        0.0,
+        "Picture fade from transparent, output seconds",
+    );
+    video_clip["fade_out"] = number(
+        0.0,
+        86400.0,
+        0.0,
+        "Picture fade to transparent, output seconds",
+    );
+    video_clip["audio"] = mix.clone();
+    let mut audio_clip = placement;
+    for (key, value) in mix["properties"].as_object().expect("object") {
+        audio_clip[key] = value.clone();
+    }
+    let track = |clip: Value| {
+        json!({"type":"object","additionalProperties":false,"properties":{
+        "name":{"type":"string","maxLength":64},
+        "role":{"enum":["dialogue","music","effects"],"description":"What this track's sound is (for a video track, its linked sound). Used by edit render --roles, FCPXML audio roles and review lint"},
+        "clips":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["start","source","duration"],"properties":clip}}}})
+    };
+    let color = json!({"type":"object","additionalProperties":false,"description":"Operator-confirmed capture encoding; overrides container metadata in reports, does not transform pixels",
+        "properties":{"transfer":{"type":"string","examples":["canon-log2","canon-log3","s-log3","bt709"]},"primaries":{"type":"string","examples":["cinema-gamut","bt2020","bt709"]},"matrix":{"type":"string"},"note":{"type":"string"}}});
+    let edit = json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Skywrite Edit v2","type":"object","additionalProperties":false,"required":["version"],"properties":{
+        "version":{"const":2},"name":{"type":"string","default":"Skywrite edit","minLength":1,"maxLength":512,"description":"Nonblank; max 512 UTF-8 bytes; XML controls prohibited"},"width":{"type":"integer","minimum":2,"maximum":8192,"multipleOf":2,"default":1920},"height":{"type":"integer","minimum":2,"maximum":8192,"multipleOf":2,"default":1080},
         "fps":{"type":"object","required":["num","den"],"additionalProperties":false,"properties":{"num":{"type":"integer","minimum":1,"maximum":1000000},"den":{"type":"integer","minimum":1,"maximum":1000000}}},
-        "clips":{"type":"array","minItems":1,"maxItems":512,"items":clip},"audio":{"type":"array","maxItems":256,"items":audio,"default":[]}
+        "duration":{"type":"number","exclusiveMinimum":0,"maximum":86400,"description":"Optional timeline length; defaults to the latest clip end"},
+        "sources":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"lut":{"type":"string","description":".cube LUT applied to this source in rendered MP4 output; NLE exports warn instead"},"color":color}}},
+        "video":{"type":"array","maxItems":16,"description":"Video tracks; index 0 is the bottom layer. Clips on one track must not overlap.","items":track(video_clip)},
+        "audio":{"type":"array","maxItems":32,"description":"Audio-only tracks, mixed with linked sound from video clips","items":track(audio_clip)},
+        "master":{"type":"object","additionalProperties":false,"properties":{"limiter_db":{"type":"number","minimum":-24,"maximum":0,"description":"Optional output limiter ceiling in dBFS. Without it, the mix is summed at unity gain and may clip."}}},
+        "captions":{"type":"array","description":"Caption tracks: {\"from_transcripts\":[\"words.json\"],\"language\":\"eng\"} maps source words through the edit (recommended), or {\"source\":\"cues.srt\"} for cues already on the output timeline. See docs/edit-format.md"},"chapters":{"type":"array","description":"See docs/edit-format.md"}
     }});
-    json!({"version":1,"edit":edit,"edit_example":{"version":1,"name":"Assembly","width":1280,"height":720,"fps":{"num":30,"den":1},"clips":[{"source":"camera.mp4","source_in":2,"duration":5,"speed":1,"volume":0},{"source":null,"duration":1},{"source":"still.png","duration":3}],"audio":[{"source":"recorder.wav","source_in":12,"offset":0,"duration":9,"speed":1,"volume":1}]},
+    json!({"version":2,"edit":edit,"edit_example":{"version":2,"name":"Interview","width":1280,"height":720,"fps":{"num":30,"den":1},
+        "video":[
+            {"name":"V1","clips":[{"start":0,"source":"camera.mp4","source_in":12.4,"duration":9,"audio":{"volume":0}},{"start":9,"source":"title.png","duration":3,"fade_out":1}]},
+            {"name":"V2 B-roll","clips":[{"start":4,"source":"broll.mp4","source_in":30,"duration":3,"fade_in":0.5,"audio":{"volume":0}}]}],
+        "audio":[
+            {"name":"Dialogue","clips":[{"start":0,"source":"recorder.wav","source_in":20.1,"duration":9,"fade_out":0.25}]},
+            {"name":"Music","clips":[{"start":0,"source":"bed.mp3","duration":12,"volume":0.5,"volume_keyframes":[{"time":0,"volume":1},{"time":1,"volume":0.3},{"time":8.5,"volume":0.3},{"time":9.5,"volume":1}],"fade_out":2}]}],
+        "master":{"limiter_db":-1}},
         "transcript_example":{"version":1,"source":"/absolute/path/camera.mp4","duration":20,"text":"Hello world","words":[{"text":"Hello","start":2.1,"end":2.4},{"text":"world","start":2.5,"end":2.8}]},
         "sync_mapping":{"formula":"reference_time = offset_seconds + scale * asset_time","playback_rate":"1 / scale","timeline_speed":"Use playback_rate when placing asset on reference timeline; trim overlap explicitly."},
-        "notes":["JSON Schema is discovery guidance; edit validate also checks frame alignment, source media bounds, supported speed/dimensions and actual files.","Primary clips are sequential. Audio overlays have absolute output offsets. Unsupported effects/transitions must be added in an NLE or optional composition editor.","Frame times use rational fps; quantize output duration and audio offset to frame grid. Source in points use seconds."]})
+        "notes":["JSON Schema is discovery guidance; edit validate also checks frame alignment, overlaps, source media bounds, LUT files and actual sources.",
+            "Every clip has an explicit timeline start. Video track 0 is the bottom layer; empty regions are black and silent. Upper-track pictures composite over lower ones, and letterboxing is transparent.",
+            "Version 1 edits (top-level clips) are rejected; run skywrite edit migrate OLD.json --output NEW.json.",
+            "The rendered MP4 applies everything here. FCPXML/Premiere XML carry layers, speed, opacity, fades and gain; they warn about LUTs and the master limiter, which must be applied in the NLE.",
+            "Transitions, titles, transforms and grading beyond a LUT belong in an NLE or composition project."]})
 }
 
 fn protect_inputs(output: &OutputOptions, inputs: &[PathBuf]) -> Result<()> {

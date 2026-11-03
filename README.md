@@ -37,6 +37,8 @@ skywrite inspect camera-a.mp4 camera-b.mp4 recorder.wav
 skywrite analyze camera-a.mp4 --local --frames 12 -o camera-a.local.json
 ```
 
+`inspect` also reports color metadata for video: FFmpeg's decoded `color_transfer`, `color_primaries`, `color_space`, range and pixel format, container tags, and, for MXF, the raw transfer/primaries/coding-equation labels from the header metadata. Private camera labels (for example Canon's) are shown raw and marked as not publicly decodable; Skywrite never guesses an encoding from pixels. When the operator confirms the capture gamma/gamut, declare it as `sources[].color` in the edit with a matching `sources[].lut`. If a camera's labels look wrong or undecodable, record a `skywrite nit` with the raw `inspect` output and the confirmed settings.
+
 Local analysis creates a manifest and persistent JPEG frames under the shared content-addressed `~/.cache/skywrite/assets/` cache (or XDG/app override). An agent with image tools can inspect the listed frame paths directly. Frame times are source playback seconds. Uniform samples are sparse evidence: they do not establish exact shot boundaries or reveal every event in a long recording.
 
 For optional OpenRouter calls, set `OPENROUTER_API_KEY` in the environment. Discover current capabilities with `skywrite models list --task analysis`, then select `--model MODEL_ID`, `SKYWRITE_ANALYSIS_MODEL`, or a saved default (`skywrite models set-default analysis MODEL_ID`). Legacy `OPENROUTER_VISION_MODEL` is supported. Skywrite does not guess an evolving model ID.
@@ -47,7 +49,7 @@ skywrite analyze camera-a.mp4 --model YOUR_VISION_MODEL --prompt 'Find useful in
 skywrite analyze recorder.wav --model YOUR_AUDIO_CAPABLE_MODEL --transcript recorder.transcript.json -o recorder.analysis.json
 ```
 
-Transcription uses OpenRouter's `/audio/transcriptions`, requests `verbose_json` with word timestamps, and sends bounded 16-kHz mono WAV chunks (60 seconds by default; adjustable from 10–120). Responses lacking actual word timestamps are rejected instead of estimating word positions. Chunk timestamps are shifted into source time, preserving any initial audio-stream delay. If a provider returns words out of order, Skywrite sorts them stably by their actual start times, preserving concurrent words and the provider transcript text; stderr and `usage.word_ordering` report any reordering. Generated transcripts include a source-content SHA-256 fingerprint; analysis rejects them if the source content changes. Manually supplied transcripts without fingerprints are accepted and marked unverified in the coverage report. Text can lose context at chunk boundaries; inspect important edits around those boundaries.
+Transcription uses OpenRouter's `/audio/transcriptions`, requests `verbose_json` with word timestamps, and sends bounded 16-kHz mono WAV chunks (60 seconds by default; adjustable from 10–120). Responses lacking actual word timestamps are rejected instead of estimating word positions. Non-speech events (for example `[laughs]`) are not stored as words. Words whose audio is near silent, or 30 dB below the chunk's typical word level, carry `audio_level_dbfs` and are counted in `usage.low_audio_words`: on ambient audio these are often recognition hallucinations, so listen before using them. Pass `--language` only when all speech is in that language: Whisper models write speech in other languages translated into the hinted one (a tester's Spanish "con la mano" came back as "With my hand" under `--language en`), so omit it for bilingual footage. Chunk timestamps are shifted into source time, preserving any initial audio-stream delay. If a provider returns words out of order, Skywrite sorts them stably by their actual start times, preserving concurrent words and the provider transcript text; stderr and `usage.word_ordering` report any reordering. Generated transcripts include a source-content SHA-256 fingerprint; analysis rejects them if the source content changes. Manually supplied transcripts without fingerprints are accepted and marked unverified in the coverage report. Text can lose context at chunk boundaries; inspect important edits around those boundaries.
 
 `--start SECONDS --duration SECONDS` limits the selected range for transcription and analysis. Transcription word positions remain relative to the full source, including that starting offset. A transcript supplied to `analyze --transcript` must reference the same source file. Audio-only remote analysis without a transcript sends at most the first 60 seconds of the chosen range and labels that coverage. Video analysis sends sampled frames; include a transcript to supply dialogue.
 
@@ -83,29 +85,36 @@ Default audio input limit is one hour per file; `--max-audio-seconds` changes th
 
 ## Create an edit
 
-`skywrite schema` prints agent-facing JSON Schema guidance and examples. A simple edit:
+`skywrite schema` prints agent-facing JSON Schema guidance and examples. A layered edit with B-roll over continuous dialogue:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "name": "First assembly",
   "width": 1280,
   "height": 720,
   "fps": {"num": 30, "den": 1},
-  "clips": [
-    {"source": "camera-a.mp4", "source_in": 2, "duration": 5, "volume": 0},
-    {"source": "title.png", "duration": 2},
-    {"source": "camera-b.mp4", "source_in": 20, "duration": 3, "volume": 0}
+  "video": [
+    {"name": "A-roll", "clips": [
+      {"start": 0, "source": "camera-a.mp4", "source_in": 2, "duration": 8, "audio": {"volume": 0}},
+      {"start": 8, "source": "title.png", "duration": 2, "fade_out": 1}
+    ]},
+    {"name": "B-roll", "clips": [
+      {"start": 3, "source": "camera-b.mp4", "source_in": 20, "duration": 3, "audio": {"volume": 0}}
+    ]}
   ],
   "audio": [
-    {"source": "recorder.wav", "source_in": 12, "offset": 0, "duration": 10, "volume": 1}
-  ]
+    {"name": "Recorder", "clips": [{"start": 0, "source": "recorder.wav", "source_in": 12, "duration": 8, "fade_out": 0.25}]},
+    {"name": "Music", "clips": [{"start": 0, "source": "bed.mp3", "duration": 10, "volume": 0.3,
+      "volume_keyframes": [{"time": 7.5, "volume": 1}, {"time": 8.5, "volume": 2}], "fade_out": 1.5}]}
+  ],
+  "master": {"limiter_db": -1}
 }
 ```
 
-Primary clips play sequentially. Omit `source` or set it to `null` for a black, silent gap. Additional audio clips use absolute output `offset` values. `source_in` and `duration` are seconds; **duration is output duration**, and a clip consumes `duration * speed` source seconds. `speed` defaults to 1 and `volume` is linear gain (0 mutes). Stills require `source_in=0` and `speed=1`. Primary sound-only media belongs in the `audio` array with a gap/still/video primary timeline.
+Every clip has an explicit timeline `start`. Video track 0 is the bottom layer; upper tracks composite above it with transparent letterboxing, optional `opacity` and picture fades. Empty timeline is black and silent. A video clip's own sound is controlled by its `audio` object; sound-only media go on `audio` tracks. `source_in` and `duration` are seconds; **duration is output duration**, and a clip consumes `duration * speed` source seconds. Volumes are linear gains (0 mutes) with optional keyframes and fades. `sources[]` can declare an operator-confirmed color encoding and a `.cube` LUT for the render. Version 1 edits are rejected; convert them with `skywrite edit migrate OLD.json --output NEW.json`. See [edit format](docs/edit-format.md).
 
-Validation checks real source files, source ranges, finite positive numbers, supported rates, stream types, even dimensions, and track duration. Output durations and offsets are rounded to the rational frame grid, with warnings in the validation result. Use `fps={"num":30000,"den":1001}` for NTSC timing. Sources use their presentation timeline; changing a sample-rate label or frame-rate declaration does not itself prove clock drift.
+Validation checks real source files, source ranges, overlaps within a track, finite positive numbers, supported rates, stream types, LUT files and even dimensions. Starts and durations are rounded to the rational frame grid, with warnings in the validation result. Use `fps={"num":30000,"den":1001}` for NTSC timing. Sources use their presentation timeline; changing a sample-rate label or frame-rate declaration does not itself prove clock drift.
 
 An external agent can write the JSON itself, or request a model draft from saved analyses:
 
@@ -116,9 +125,30 @@ skywrite edit validate edit.json
 
 Suggestions use only analyzed sources and are validated before being written. Models still need editorial review; sparse observations cannot guarantee a good cut. The deterministic renderer never executes generated Python/JavaScript or asks a model to hand-author FCPXML.
 
+## Describe frames and video
+
+```sh
+skywrite describe frames camera-a.mp4 --every 30 -o survey.json
+skywrite describe frames camera-a.mp4 --around 125.4 --window 1 --cast cast.json -o cut.json
+skywrite describe video camera-a.mp4 --start 56 --duration 8 -o moment.json
+```
+
+Frame descriptions are cached per exact frame, model, prompt and cast, and selected on the source's absolute frame grid, so a dense pass around a candidate cut reuses everything a coarse survey already described. A cast file of text appearance descriptions adds advisory "who is visible" hints (no face recognition). Video descriptions report timed gestures, expressions and shot changes from a short re-encoded range. Defaults (GPT-6 Luna for frames, Gemini 3.1 Flash Lite for video, Scribe v2 for verbatim transcription) come from a measured [model evaluation](docs/model-evaluation.md). Understanding requests use zero-retention providers by default. See [descriptions](docs/describe.md).
+
+## Review an edit
+
+```sh
+skywrite review sheet camera.mp4 --start 120 --duration 1 --every 2 -o around-cut.jpg
+skywrite review cuts edit.json --handles 1.5 --output-dir cut-review
+skywrite review lint edit.json --transcript presenter.transcript.json
+```
+
+Contact sheets tile consecutive exact frames with source times, so expressions and motion around a candidate cut are visible rather than guessed from sparse samples. Cut auditions are short clips of the rendered edit around every cut for watching and listening. Lint reports objective problems: a visible speaker with no audible dialogue, repeated words at or inside a cut, words clipped by a cut, filler words, sound cut off mid-flow (applause, music tails), and beds close to dialogue level. None of these judge taste. See [reviewing an edit](docs/review.md).
+
 ## Export and render
 
 ```sh
+skywrite edit export edit.json --to premiere -o edit.xml
 skywrite edit export edit.json --to fcpxml -o edit.fcpxml
 skywrite edit render edit.json -o preview.mp4
 skywrite edit export edit.json --to ffmpeg -o render.py
@@ -127,8 +157,10 @@ skywrite edit export edit.json --to hyperframes -o hyperframes-project
 skywrite edit export edit.json --to remotion -o remotion-project
 ```
 
-- **FCPXML:** generates an FCPXML 1.10 assembly with rational timing, original-media references, audio lanes, and constant retiming. Actual Final Cut/Resolve import must be checked in those applications; generating XML on Linux cannot certify application import fidelity.
-- **Native render:** calls installed FFmpeg, fits video/stills into the output canvas, conforms constant speed, mixes audio, and creates an MP4. It preserves the originals. The generated Python renderer uses only the Python standard library and FFmpeg, with the same compiled edit operations.
+- **Import:** `skywrite edit import premiere.xml -o edit.json` brings an editor's Premiere/FCP 7 XML timeline back as a layered edit (layers, linked sound, speed, opacity, levels, fades, markers); `.prproj` is read experimentally.
+- **Premiere XML:** writes Final Cut Pro 7 XML (xmeml v5), which Premiere Pro imports. Video tracks, linked sound, audio tracks, speed (Time Remap), opacity/fades and gain keyframes (Audio Levels) are carried; whole-frame timing rounds subframe in points, with a warning. Structure and timing are checked with OpenTimelineIO's independent reader; import into Premiere itself is not yet verified, so report results with `skywrite nit`.
+- **FCPXML:** generates an FCPXML 1.10 timeline with rational timing, original-media references, a connected storyline per track, constant retiming, blend and volume keyframes. Actual Final Cut/Resolve import must be checked in those applications; generating XML on Linux cannot certify application import fidelity.
+- **Native render:** calls installed FFmpeg, composites layers, applies LUTs, opacity, fades, gain keyframes and the optional master limiter, conforms constant speed, mixes audio, and creates an MP4. It preserves the originals. The generated Python renderer uses only the Python standard library and FFmpeg, with the same compiled edit operations. NLE exports warn about LUTs and the limiter, which must be applied in the NLE to match.
 - **Hyperframes:** exports a new HTML composition project and copied assets for the installed CLI. Follow the generated README for lint/preview/render. Existing project directories are never overwritten.
 - **Remotion:** exports a new React composition project and copied assets. Install the generated npm dependencies inside that project, then preview/render using its scripts. This optional backend currently requires integer fps; use FCPXML/FFmpeg for rational fps. Remotion's own runtime and licensing apply.
 

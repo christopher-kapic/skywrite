@@ -1,7 +1,8 @@
 //! Container metadata and actual decoding agree on source-relative time.
+use serde_json::json;
 use skywrite::{
     export, media, process,
-    timeline::{self, Clip, Edit, Rational},
+    timeline::{self, Edit},
 };
 use std::{path::Path, time::Duration};
 fn command(program: &str, args: &[&str]) -> std::process::Output {
@@ -14,23 +15,9 @@ fn command(program: &str, args: &[&str]) -> std::process::Output {
     .unwrap()
 }
 fn specification(source: &Path, source_in: f64, duration: f64) -> Edit {
-    Edit {
-        version: 1,
-        name: "Origin".into(),
-        width: 160,
-        height: 90,
-        fps: Rational { num: 30, den: 1 },
-        clips: vec![Clip {
-            source: Some(source.to_owned()),
-            source_in,
-            duration,
-            speed: 1.0,
-            volume: 1.0,
-        }],
-        audio: vec![],
-        captions: vec![],
-        chapters: vec![],
-    }
+    timeline::parse(json!({"version":2,"name":"Origin","width":160,"height":90,"fps":{"num":30,"den":1},
+        "video":[{"clips":[{"start":0,"source":source,"source_in":source_in,"duration":duration}]}]}))
+    .unwrap()
 }
 #[test]
 fn presentation_duration_normalizes_only_matroska_end_timestamps() {

@@ -14,6 +14,8 @@ const CONFIG_LIMIT: usize = 64 * 1024;
 const NIT_LIMIT: usize = 8192;
 pub const MODEL_TASKS: &[&str] = &[
     "analysis",
+    "frame-description",
+    "video-description",
     "transcription",
     "editing",
     "image-generation",
@@ -70,6 +72,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ),
     ("remotion", include_str!("../assets/skills/remotion.md")),
     ("fcpxml", include_str!("../assets/skills/fcpxml.md")),
+    ("premiere", include_str!("../assets/skills/premiere.md")),
     ("ffmpeg", include_str!("../assets/skills/ffmpeg.md")),
     ("takumi", include_str!("../assets/skills/takumi.md")),
     (
@@ -213,9 +216,7 @@ fn publish(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     if overwrite {
         temporary.persist(path).map_err(|error| error.error)?;
     } else {
-        temporary
-            .persist_noclobber(path)
-            .map_err(|error| error.error)?;
+        crate::io::persist_new(temporary, path)?;
     }
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -371,9 +372,7 @@ pub fn record_nit(description: &str) -> Result<Value> {
         elapsed.as_secs(),
         elapsed.subsec_nanos()
     ));
-    temporary
-        .persist_noclobber(&path)
-        .map_err(|error| error.error)?;
+    crate::io::persist_new(temporary, &path)?;
     File::open(&directory)?.sync_all()?;
     Ok(json!({"saved":true,"path":path.display().to_string(),"nit":value}))
 }

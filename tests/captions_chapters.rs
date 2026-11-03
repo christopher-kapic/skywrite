@@ -21,7 +21,7 @@ fn fixture(dir: &Path, mode: &str) -> std::path::PathBuf {
     )
     .unwrap();
     let path = dir.join("edit.json");
-    fs::write(&path,serde_json::to_vec_pretty(&json!({"version":1,"width":320,"height":180,"fps":{"num":30,"den":1},"clips":[{"duration":2}],"captions":[{"source":"cues.srt","language":"eng","mode":mode}],"chapters":[{"start":0,"title":"Opening 'Ω' & <safe>;#=\\"},{"start":1,"title":"Next"}]})).unwrap()).unwrap();
+    fs::write(&path,serde_json::to_vec_pretty(&json!({"version":2,"width":320,"height":180,"fps":{"num":30,"den":1},"duration":2,"captions":[{"source":"cues.srt","language":"eng","mode":mode}],"chapters":[{"start":0,"title":"Opening 'Ω' & <safe>;#=\\"},{"start":1,"title":"Next"}]})).unwrap()).unwrap();
     path
 }
 fn probe(path: &Path) -> Value {
@@ -319,7 +319,7 @@ fn optional_projects_keep_inert_sidecars_and_fcpxml_metadata() {
     assert!(!result["warnings"].as_array().unwrap().is_empty());
     let text = fs::read_to_string(xml).unwrap();
     assert!(text.contains("<chapter-marker"));
-    assert!(text.contains("<note>"));
+    assert!(text.contains("<caption lane=") && text.contains("captionFormat=SRT.en"));
     assert!(text.contains("&lt;safe&gt;"));
     assert!(!text.contains("<safe>"));
 }
@@ -438,7 +438,7 @@ fn failed_native_and_python_renders_preserve_previous_outputs_and_inputs() {
         ],
     );
     let mut spec: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    spec["clips"][0]["source"] = json!("input.mp4");
+    spec["video"] = json!([{"clips":[{"start":0,"source":"input.mp4","duration":2}]}]);
     fs::write(&file, serde_json::to_vec(&spec).unwrap()).unwrap();
     let edit = timeline::load_and_validate(&file).unwrap();
     let script = d.path().join("render.py");
@@ -482,7 +482,7 @@ fn actual_python_cancellation_preserves_old_output_and_cleans_sidecars() {
     let d = tempfile::tempdir().unwrap();
     let file = fixture(d.path(), "soft");
     let mut spec: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    spec["clips"][0]["duration"] = json!(3600);
+    spec["duration"] = json!(3600);
     fs::write(&file, serde_json::to_vec(&spec).unwrap()).unwrap();
     let edit = timeline::load_and_validate(&file).unwrap();
     let script = d.path().join("render.py");

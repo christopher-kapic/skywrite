@@ -1,10 +1,12 @@
 {
   "version": 1,
-  "curated_on": "2026-10-30",
+  "curated_on": "2026-11-02",
   "note": "Explicit starter preferences, not an automatically changing best-model ranking. Availability and prices can change. Initialization is offline and makes no paid requests.",
   "presets": [
     {"task":"analysis","model":"google/gemini-3.5-flash-lite","reason":"Low-cost multimodal model used in Skywrite's public-media understanding validation."},
-    {"task":"transcription","model":"openai/whisper-large-v3","reason":"Existing word-timestamp transcription model used in public-media validation."},
+    {"task":"frame-description","model":"openai/gpt-6-luna","reason":"Lowest hallucination in a 22-frame evaluation (docs/model-evaluation.md), about $0.22 per 1,000 frames, zero-retention routing via Azure. Reasoning is disabled per frame."},
+    {"task":"video-description","model":"google/gemini-3.1-flash-lite","reason":"Most accurate inline-video description in evaluation: found every shot change and gesture timing; zero-retention via Vertex; about $0.0017 per minute at 480p."},
+    {"task":"transcription","model":"elevenlabs/scribe-v2","reason":"Best verbatim word timestamps in evaluation: kept 67% of fillers and 90% of repeated words (Whisper: 26% and 20%); zero-retention."},
     {"task":"editing","model":"google/gemini-3.5-flash-lite","reason":"Used for a validated edit suggestion; inspect and revise generated editorial choices."},
     {"task":"image-generation","model":"black-forest-labs/flux-3-image-klein","reason":"Low-cost image and reference-image generation verified in the character workflow."},
     {"task":"video-generation","model":"minimax/hailuo-3-max","reason":"H3 Max was verified with an image-guided five-second clip. Choose duration and resolution explicitly; full H3 can be selected separately."},

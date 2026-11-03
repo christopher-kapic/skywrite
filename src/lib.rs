@@ -31,3 +31,11 @@ pub mod project;
 pub mod audio;
 
 pub mod captions;
+
+pub mod color;
+
+pub mod review;
+
+pub mod describe;
+
+pub mod import;
