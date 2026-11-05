@@ -505,6 +505,20 @@ fn subframe_source_end_rounding_is_padded_not_rejected() {
     );
     let output = dir.path().join("padded.mp4");
     export::render(&validated, &output, false).unwrap();
+    // Interchange files end the clip on the last whole frame inside the media.
+    for (target, name) in [("fcpxml", "edit.fcpxml"), ("premiere", "edit.xml")] {
+        let report = export::export(&validated, target, &dir.path().join(name), false).unwrap();
+        assert!(
+            report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("ends 1 frame(s) earlier")),
+            "{report}"
+        );
+    }
+    let xml = std::fs::read_to_string(dir.path().join("edit.xml")).unwrap();
+    assert!(xml.contains("<out>43</out>"), "{xml}");
     // A whole extra frame is a real overrun, not rounding.
     let error = timeline::validate(&timeline::parse(edit(1.5)).unwrap(), dir.path())
         .err()

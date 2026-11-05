@@ -50,7 +50,9 @@ apply, including to image outputs used by dependent nodes.
 Image actions accept `prompt`, `references`, `resolution`, `aspect_ratio`, `seed`.
 Video actions accept those fields plus `first_frame`, `last_frame`, `duration`,
 `audio`; frame inputs cannot be combined with general references. Speech accepts
-`text`, `voice`, `instructions`, `speed`. Music accepts `prompt`, `instrumental`,
+`text` (up to 64 KiB), `voice`, `instructions`, `speed` and `paragraph_pause`
+(seconds, default 0.3). Long text becomes one combined narration job, exactly
+as with `generate speech`; see [long narration](audio-generation.md#long-narration). Music accepts `prompt`, `instrumental`,
 and one image `reference`. Model-specific support is validated by the existing
 adapters. Dependency images use an internal placeholder only for capability
 preflight; their real bytes determine the actual job ID once the dependency is

@@ -17,9 +17,87 @@ mod fcpxml;
 mod project;
 mod xmeml;
 
+/// Nearest-frame rounding may run a clip up to half a frame past its media end.
+/// Skywrite's renderers pad that tail, but an NLE may treat it as missing media,
+/// so interchange files end such clips on the last whole frame inside the media.
+fn within_media(edit: &ValidatedEdit) -> (ValidatedEdit, Vec<String>) {
+    let mut edit = edit.clone();
+    let fps = edit.fps;
+    let mut notes = Vec::new();
+    let overruns = |source_in: f64, frames: u64, speed: f64, media: &crate::media::MediaInfo| {
+        source_in + fps.seconds(frames) * speed > media.duration + 0.002
+    };
+    let fit_mix = |mix: &mut crate::timeline::ValidatedMix, duration: f64| {
+        mix.fade_out = mix.fade_out.min((duration - mix.fade_in).max(0.0));
+    };
+    for track in &mut edit.video {
+        for clip in &mut track.clips {
+            if clip.kind != MediaKind::Video {
+                continue;
+            }
+            let before = clip.duration_frames;
+            while clip.duration_frames > 1
+                && overruns(
+                    clip.source_in,
+                    clip.duration_frames,
+                    clip.speed,
+                    &clip.media,
+                )
+            {
+                clip.duration_frames -= 1;
+            }
+            if clip.duration_frames != before {
+                let duration = fps.seconds(clip.duration_frames);
+                clip.fade_out = clip.fade_out.min((duration - clip.fade_in).max(0.0));
+                fit_mix(&mut clip.audio, duration);
+                notes.push(format!(
+                    "video track {} clip {}: ends {} frame(s) earlier in this interchange file so it stays within its media",
+                    clip.track,
+                    clip.index,
+                    before - clip.duration_frames
+                ));
+            }
+        }
+    }
+    for track in &mut edit.audio {
+        for clip in &mut track.clips {
+            let before = clip.duration_frames;
+            while clip.duration_frames > 1
+                && overruns(
+                    clip.source_in,
+                    clip.duration_frames,
+                    clip.speed,
+                    &clip.media,
+                )
+            {
+                clip.duration_frames -= 1;
+            }
+            if clip.duration_frames != before {
+                fit_mix(&mut clip.mix, fps.seconds(clip.duration_frames));
+                notes.push(format!(
+                    "audio track {} clip {}: ends {} frame(s) earlier in this interchange file so it stays within its media",
+                    clip.track,
+                    clip.index,
+                    before - clip.duration_frames
+                ));
+            }
+        }
+    }
+    (edit, notes)
+}
+
 pub fn export(edit: &ValidatedEdit, target: &str, output: &Path, overwrite: bool) -> Result<Value> {
     prevent_source_overwrite(edit, output)?;
     let mut warnings = edit.warnings.clone();
+    let interchange;
+    let edit = if matches!(target, "fcpxml" | "premiere" | "xmeml" | "fcp7") {
+        let (fitted, notes) = within_media(edit);
+        warnings.extend(notes);
+        interchange = fitted;
+        &interchange
+    } else {
+        edit
+    };
     let mut sidecar_files: Vec<PathBuf> = Vec::new();
     match target {
         "fcpxml" => {

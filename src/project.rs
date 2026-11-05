@@ -135,6 +135,9 @@ pub enum Action {
         instructions: Option<String>,
         #[serde(default)]
         speed: Option<f64>,
+        /// Silence at paragraph seams when long text is split into sections.
+        #[serde(default = "default_paragraph_pause")]
+        paragraph_pause: f64,
     },
     Music {
         prompt: String,
@@ -170,6 +173,9 @@ impl Action {
             Self::Speech { .. } => vec![],
         }
     }
+}
+fn default_paragraph_pause() -> f64 {
+    0.3
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,8 +366,12 @@ fn validate(l: &Loaded) -> Result<()> {
                 instructions,
                 voice,
                 speed,
+                paragraph_pause,
             } => {
-                check_text(text, 8192, "speech text")?;
+                check_text(text, crate::speech_split::MAX_SCRIPT_BYTES, "speech text")?;
+                if !paragraph_pause.is_finite() || !(0.0..=5.0).contains(paragraph_pause) {
+                    bail!("paragraph_pause must be 0..5 seconds");
+                }
                 if let Some(s) = instructions {
                     check_text(s, 4096, "instructions")?;
                 }
@@ -707,14 +717,14 @@ fn command(
             voice,
             instructions,
             speed,
+            paragraph_pause,
         } => GenerateCommand::Speech(crate::audio_generation::SpeechArgs {
             text: Some(text.clone()),
             file: None,
             voice: voice.clone(),
             instructions: instructions.clone(),
             speed: *speed,
-            paragraph_pause: 0.3,
-            single_request: true,
+            paragraph_pause: *paragraph_pause,
             common,
         }),
         Action::Music {

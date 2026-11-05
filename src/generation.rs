@@ -15,6 +15,9 @@ const MAX_JSON: usize = 64 * 1024 * 1024;
 const MAX_IMAGE: usize = 32 * 1024 * 1024;
 const MAX_VIDEO: u64 = 512 * 1024 * 1024;
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_JOINED_AUDIO: u64 = 128 * 1024 * 1024;
+/// Published audio bound: an hour of 48-kHz stereo PCM16 WAV fits.
+const MAX_PUBLISHED_AUDIO: u64 = 768 * 1024 * 1024;
 #[derive(Debug, Args)]
 pub struct Common {
     #[arg(long)]
@@ -162,6 +165,9 @@ struct Artifact {
     /// Set only after this version actually decodes these hash-identified bytes.
     #[serde(default)]
     decode_validation_version: u32,
+    /// Decoded sample peak and RMS for audio, measured once at completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    levels: Option<Value>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Job {
@@ -181,6 +187,10 @@ struct Job {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_text: Option<String>,
+    /// Long narration: section job IDs, timing and budget. The joined artifact
+    /// is assembled locally from those section jobs, never requested directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split: Option<Value>,
 }
 fn timestamp() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
@@ -343,7 +353,8 @@ fn artifact_path(dir: &Path, a: &Artifact) -> Result<PathBuf> {
     }
     let max_bytes = match a.media_type.as_str() {
         "video/mp4" => MAX_VIDEO,
-        "audio/mpeg" | "audio/wav" => crate::audio_generation::MAX_AUDIO as u64,
+        // Joined long narration exceeds one response's 32 MiB receipt bound.
+        "audio/mpeg" | "audio/wav" => MAX_JOINED_AUDIO,
         _ => MAX_IMAGE as u64,
     };
     if a.bytes > max_bytes {
@@ -464,11 +475,22 @@ fn public_job(dir: &Path, job: &Job) -> Result<Value> {
         out["artifact_path"] = json!(artifact_path(dir, a)?);
     }
     out["resume"] = json!(format!("skywrite jobs resume {}", job.id));
+    if let Some(peak) = job
+        .artifact
+        .as_ref()
+        .and_then(|a| a.levels.as_ref())
+        .and_then(|l| l["peak_dbfs"].as_f64())
+        .filter(|p| *p > 0.0)
+    {
+        out["warnings"] = json!([format!(
+            "decoded peak is {peak:+.2} dBFS, above full scale: it clips in fixed-point formats and mixes. Normalize with `skywrite audio` before use."
+        )]);
+    }
     if is_audio_task(&job.task)
         && job.status == "completed"
         && job.usage.as_ref().is_none_or(Value::is_null)
     {
-        out["usage_note"] = json!(if job.generation_id.is_some() {
+        out["usage_note"] = json!(if job.generation_id.is_some() || job.split.is_some() {
             format!(
                 "Cost unknown, not zero: billing had not settled. Run `skywrite jobs status {} --refresh` later to fetch it.",
                 job.id
@@ -1190,6 +1212,7 @@ fn submit_with_upload(
             artifact: None,
             error: None,
             output_text: None,
+            split: None,
         };
         save_job(&dir, &mut job)?;
         job
@@ -1364,6 +1387,7 @@ fn complete_image(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
         media_type: mime.into(),
         bytes: bytes.len() as u64,
         decode_validation_version: 1,
+        levels: None,
     });
     job.usage = response.get("usage").cloned();
     job.status = "completed".into();
@@ -1442,6 +1466,7 @@ fn refresh_video(dir: &Path, job: &mut Job, transport: &Transport, wait: u64) ->
                 media_type: "video/mp4".into(),
                 bytes,
                 decode_validation_version: 1,
+                levels: None,
             });
             job.status = "completed".into();
             job.error = None;
@@ -1714,6 +1739,29 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 refresh_video(&dir, &mut job, &Transport::new()?, 0)?;
             }
             if refresh
+                && job.usage.as_ref().is_none_or(Value::is_null)
+                && let Some(split) = &job.split
+                && let Some(sections) = split["sections"].as_array()
+                && !sections.is_empty()
+            {
+                let mut total = Some(0.0);
+                for section in sections {
+                    let id = section["job_id"].as_str().context("section lacks job ID")?;
+                    let receipt = execute_jobs(JobsCommand::Status {
+                        id: id.into(),
+                        refresh: true,
+                    })?;
+                    total = total
+                        .zip(receipt["usage"]["cost"].as_f64())
+                        .map(|(a, b)| a + b);
+                }
+                if let Some(cost) = total {
+                    job.usage =
+                        Some(json!({"cost":cost,"source":"sum of section generation metadata"}));
+                    save_job(&dir, &mut job)?;
+                }
+            }
+            if refresh
                 && is_audio_task(&job.task)
                 && job.usage.as_ref().is_none_or(Value::is_null)
                 && let Some(id) = &job.generation_id
@@ -1736,6 +1784,14 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
             remote_id: adopt,
         } => {
             wait_check(wait)?;
+            if let Some(plan) = split_plan(&id)? {
+                if adopt.is_some() {
+                    bail!(
+                        "--remote-id applies only to video jobs; this is a combined narration job"
+                    );
+                }
+                return crate::speech_split::resume(&id, plan, output, overwrite);
+            }
             let (dir, _lock) = locked_job(&id)?;
             let mut job = load_job(&dir)?;
             validate_output(output.as_deref(), &job.references, overwrite)?;
@@ -2084,12 +2140,14 @@ fn complete_synchronous(dir: &Path, job: &mut Job, response: &Value) -> Result<(
     temp.persist(dir.join(&file)).map_err(|e| e.error)?;
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
+    let levels = audio_levels(&dir.join(&file));
     job.artifact = Some(Artifact {
         file,
         sha256: bytes_sha256(&audio.bytes),
         media_type: audio.media_type.into(),
         bytes: audio.bytes.len() as u64,
         decode_validation_version: 1,
+        levels,
     });
     if let Some(id) = response["generation_id"].as_str().filter(|v| !v.is_empty()) {
         remote_id(id)?;
@@ -2105,6 +2163,147 @@ fn complete_synchronous(dir: &Path, job: &mut Job, response: &Value) -> Result<(
     job.status = "completed".into();
     job.error = None;
     save_job(dir, job)
+}
+/// Decoded levels of generated audio, the same measurement as
+/// `inspect --exact-audio`. Optional evidence: a failed measurement never
+/// fails a paid result that already decoded.
+fn audio_levels(path: &Path) -> Option<Value> {
+    let info = crate::media::probe(path).ok()?;
+    let timing = crate::timing::measure_audio(&info).ok()?;
+    Some(json!({"peak_dbfs":timing.peak_dbfs,"rms_dbfs":timing.rms_dbfs}))
+}
+/// Fails when a project planned a different identity than `id`. Split narration
+/// checks its combined job ID here, then runs its section jobs unplanned.
+pub(crate) fn check_planned_identity(id: &str) -> Result<()> {
+    EXPECTED_PROJECT_JOB.with(|cell| {
+        if cell
+            .borrow()
+            .as_ref()
+            .is_some_and(|expected| expected != id)
+        {
+            bail!("project planned identity changed before generation; no request submitted");
+        }
+        Ok(())
+    })
+}
+pub(crate) fn without_planned_identity<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXPECTED_PROJECT_JOB.with(|cell| {
+                *cell.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let old = EXPECTED_PROJECT_JOB.with(|cell| cell.replace(None));
+    let _restore = Restore(old);
+    work()
+}
+/// Saved plan that lets `jobs resume` rerun a combined narration job.
+pub(crate) const SPLIT_PLAN: &str = "split-plan.json";
+/// A locked combined narration job record.
+pub(crate) struct SplitJob {
+    dir: PathBuf,
+    job: Job,
+    _lock: File,
+}
+impl SplitJob {
+    /// Opens or creates the combined record. The plan file is written once, before
+    /// any section request, so an interrupted run can always be resumed.
+    pub(crate) fn open(
+        id: &str,
+        model: &str,
+        request: Value,
+        references: Vec<Value>,
+        plan: &Value,
+    ) -> Result<Self> {
+        let (dir, lock) = locked_job(id)?;
+        let job = if job_path_exists(&dir.join("job.json"))? {
+            let job = load_job(&dir)?;
+            if job.split.is_none() || job.model != model || job.task != "speech-generation" {
+                bail!("job {id} is not this combined narration job");
+            }
+            job
+        } else {
+            crate::io::write_json(&dir.join(SPLIT_PLAN), plan, true)?;
+            let now = timestamp()?;
+            let mut job = Job {
+                version: 1,
+                id: id.into(),
+                task: "speech-generation".into(),
+                model: model.into(),
+                status: "prepared".into(),
+                created_at: now,
+                updated_at: now,
+                request,
+                references,
+                remote_id: None,
+                generation_id: None,
+                usage: None,
+                artifact: None,
+                error: None,
+                output_text: None,
+                split: Some(json!({"sections":[]})),
+            };
+            save_job(&dir, &mut job)?;
+            job
+        };
+        Ok(Self {
+            dir,
+            job,
+            _lock: lock,
+        })
+    }
+    pub(crate) fn status(&self) -> &str {
+        &self.job.status
+    }
+    /// Records a section that blocks completion; the combined job mirrors it.
+    pub(crate) fn block(&mut self, status: &str, error: String) -> Result<()> {
+        self.job.status = status.into();
+        self.job.error = Some(error);
+        save_job(&self.dir, &mut self.job)
+    }
+    /// Adopts a locally joined MP3 as the artifact and records section timing.
+    pub(crate) fn complete(&mut self, joined: &Path, usage: Value, split: Value) -> Result<()> {
+        let bytes = fs::read(joined)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_JOINED_AUDIO {
+            bail!("joined narration must contain 1..128 MiB");
+        }
+        let target = self.dir.join("result.mp3");
+        crate::io::atomic_write(&target, &bytes, true)?;
+        self.job.artifact = Some(Artifact {
+            file: "result.mp3".into(),
+            sha256: bytes_sha256(&bytes),
+            media_type: "audio/mpeg".into(),
+            bytes: bytes.len() as u64,
+            // Decoded sample-exactly while joining.
+            decode_validation_version: 1,
+            levels: audio_levels(&target),
+        });
+        self.job.usage = Some(usage).filter(|u| !u["cost"].is_null());
+        self.job.split = Some(split);
+        self.job.status = "completed".into();
+        self.job.error = None;
+        save_job(&self.dir, &mut self.job)
+    }
+    pub(crate) fn publish(&self, output: &Path, overwrite: bool) -> Result<()> {
+        publish(&self.dir, &self.job, output, overwrite)
+    }
+    pub(crate) fn public(&self) -> Result<Value> {
+        public_job(&self.dir, &self.job)
+    }
+}
+/// The saved plan of a combined narration job, if `id` is one.
+fn split_plan(id: &str) -> Result<Option<Value>> {
+    valid_id(id)?;
+    let path = jobs_root()?.join(id).join(SPLIT_PLAN);
+    if !job_path_exists(&path)? {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&limited(
+        open_regular(&path, false)?,
+        1024 * 1024,
+    )?)?))
 }
 /// Output checks for audio a caller assembles itself (split narration), run
 /// before any paid request so a bad path cannot waste generated sections.
@@ -2123,22 +2322,6 @@ pub(crate) fn validate_audio_output(
         bail!("output extension does not match requested media kind");
     }
     Ok(())
-}
-/// Publish locally assembled audio with the same conversion and no-clobber rules
-/// as job artifacts. `source` must not already have the output's extension.
-pub(crate) fn publish_assembled_audio(
-    source: &Path,
-    output: &Path,
-    references: &[Value],
-    overwrite: bool,
-) -> Result<()> {
-    validate_audio_output(output, references, overwrite)?;
-    let extension = output
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    publish_audio(source, output, &extension, overwrite)
 }
 fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool) -> Result<()> {
     if !matches!(extension, "mp3" | "wav") {
@@ -2180,8 +2363,8 @@ fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool)
         args.push(temp.path().as_os_str().to_owned());
         crate::process::run("ffmpeg", &args, Duration::from_secs(180), 1024 * 1024)?;
     }
-    if temp.as_file().metadata()?.len() > 128 * 1024 * 1024 {
-        bail!("published audio exceeds 128 MiB");
+    if temp.as_file().metadata()?.len() > MAX_PUBLISHED_AUDIO {
+        bail!("published audio exceeds 768 MiB");
     }
     temp.as_file().sync_all()?;
     if overwrite {

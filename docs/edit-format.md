@@ -70,7 +70,10 @@ nearest output frame, and the validator reports rounding. `source_in` keeps its
 precision (word-accurate dialogue cuts). Because rounding is to the nearest
 frame, a clip that uses a source to its very end may run up to half an output
 frame past it; that tail is accepted with a warning and padded (silence, held
-last picture), so durations need not be floored. Longer overruns are rejected. Use rational rates such as
+last picture) by Skywrite's renderers, so durations need not be floored.
+FCPXML and Premiere XML exports instead end such a clip on the last whole frame
+inside its media, with a warning, because an NLE may treat the tail as missing
+media. Longer overruns are rejected. Use rational rates such as
 `{"num":30000,"den":1001}` for NTSC.
 
 ## Pictures

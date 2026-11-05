@@ -32,9 +32,6 @@ pub struct SpeechArgs {
     /// Only applies when the script is too long for one request.
     #[arg(long, default_value_t = 0.3)]
     pub paragraph_pause: f64,
-    /// Project nodes record one job each, so they must fit one request.
-    #[arg(skip)]
-    pub single_request: bool,
     #[command(flatten)]
     pub common: crate::generation::Common,
 }
@@ -118,13 +115,6 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
     }
     let budget = crate::speech_split::budget(&model, &caps);
     let split = crate::speech_split::needs_split(&text, budget.chars);
-    if split && args.single_request {
-        bail!(
-            "speech node text exceeds one request for {model} ({} characters, from {}); split it into several speech nodes at paragraph breaks",
-            budget.chars,
-            budget.source
-        );
-    }
     let mut body = json!({"model":model,"input":text,"response_format":"mp3"});
     if let Some(v) = args.voice {
         body["voice"] = json!(v);

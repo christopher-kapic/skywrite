@@ -802,3 +802,126 @@ fn project_hash_actual_bytes_bound_even_after_real_file_grows() {
         INPUT_IMAGE_LIMIT
     );
 }
+#[test]
+fn long_speech_node_is_one_combined_job() {
+    const SELECTOR: &str = "project::tests::long_speech_node_is_one_combined_job";
+    if std::env::var_os("SKYWRITE_SPLIT_PROJECT_CHILD").is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", SELECTOR, "--nocapture"])
+            .env("SKYWRITE_SPLIT_PROJECT_CHILD", temp.path())
+            .env("SKYWRITE_HOME", temp.path().join("home"))
+            .env_remove("OPENROUTER_API_KEY")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("SKYWRITE_SPLIT_PROJECT_CHILD").unwrap());
+    let cache = root.join("cache");
+    catalog(
+        &cache,
+        "models?output_modalities=speech",
+        json!([{"id":"fixture/speech","context_length":0,"architecture":{"input_modalities":["text"],"output_modalities":["speech"]}}]),
+    );
+    let wav = root.join("tone.wav");
+    let mut ff = crate::process::args(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=0.2",
+        "-acodec",
+        "pcm_s16le",
+    ]);
+    ff.push(wav.as_os_str().to_owned());
+    crate::process::run("ffmpeg", &ff, Duration::from_secs(10), 1024 * 1024).unwrap();
+    let audio = fs::read(&wav).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let posts = Arc::new(AtomicUsize::new(0));
+    let (end, count) = (stop.clone(), posts.clone());
+    let handle = std::thread::spawn(move || {
+        while !end.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut bytes = vec![];
+                    let mut buf = [0; 4096];
+                    let end = loop {
+                        let n = socket.read(&mut buf).unwrap();
+                        assert!(n > 0);
+                        bytes.extend(&buf[..n]);
+                        if let Some(i) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let header = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    assert!(header.starts_with("post /audio/speech "), "{header}");
+                    let len: usize = header
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    while bytes.len() < end + len {
+                        let n = socket.read(&mut buf).unwrap();
+                        bytes.extend(&buf[..n]);
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        audio.len()
+                    );
+                    socket.write_all(head.as_bytes()).unwrap();
+                    socket.write_all(&audio).unwrap();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    });
+    // Three distinct 1200-character paragraphs exceed the 2000-character default.
+    let text = (0..3)
+        .map(|p| {
+            (0..20)
+                .map(|i| format!("Paragraph {p} sentence {i} has some words in it here."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let node = json!({"id":"voice","output":"voice.mp3","model":"fixture/speech","action":{"type":"speech","text":text,"paragraph_pause":0.25}});
+    let path = manifest(&root, "narration", vec![node]);
+    let engine = Engine { base: Some(base) };
+    let result = run(args(&path, &cache), false, engine.clone()).unwrap();
+    assert_eq!(result["complete"], true, "{result}");
+    assert_eq!(posts.load(Ordering::SeqCst), 3);
+    let job = result["nodes"][0]["job_id"].as_str().unwrap().to_owned();
+    let receipt = crate::generation::execute_jobs(crate::generation::JobsCommand::Status {
+        id: job,
+        refresh: false,
+    })
+    .unwrap();
+    assert_eq!(
+        receipt["split"]["sections"].as_array().unwrap().len(),
+        3,
+        "{receipt}"
+    );
+    // Rerunning a complete project makes no requests.
+    run(args(&path, &cache), false, engine).unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), 3);
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+}

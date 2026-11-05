@@ -307,8 +307,94 @@ fn first_words(text: &str) -> String {
     out
 }
 
-/// Runs every section job (or previews them) and joins the results.
+fn break_from(name: &str) -> Result<Break> {
+    Ok(match name {
+        "start" => Break::Start,
+        "paragraph" => Break::Paragraph,
+        "sentence" => Break::Sentence,
+        "word" => Break::Word,
+        _ => bail!("invalid saved section break {name}"),
+    })
+}
+
+/// The combined job identity: every section request plus how they are joined.
+fn identity(plan: &Plan, sections: &[Section]) -> Result<String> {
+    let mut template = plan.body.clone();
+    template["input"] = Value::Null;
+    let sections: Vec<Value> = sections
+        .iter()
+        .map(|s| json!({"text":s.text,"before":s.before.name()}))
+        .collect();
+    let joined =
+        json!({"template":template,"sections":sections,"paragraph_pause":plan.paragraph_pause});
+    Ok(crate::openrouter::cache_key(&[
+        b"skywrite-split-speech-v1",
+        &serde_json::to_vec(&joined)?,
+        plan.common.take.as_deref().unwrap_or("").as_bytes(),
+    ]))
+}
+
+/// Splits a script and generates (or previews) it as one combined job.
 pub(crate) fn run(plan: Plan, text: &str) -> Result<Value> {
+    let sections = split(text, plan.budget.chars);
+    execute(plan, sections)
+}
+
+/// Continues a combined job from its saved plan, never re-splitting the text.
+pub(crate) fn resume(
+    id: &str,
+    saved: Value,
+    output: Option<std::path::PathBuf>,
+    overwrite: bool,
+) -> Result<Value> {
+    let sections = saved["sections"]
+        .as_array()
+        .context("saved narration plan lacks sections")?
+        .iter()
+        .map(|s| {
+            Ok(Section {
+                text: s["text"]
+                    .as_str()
+                    .context("saved section lacks text")?
+                    .to_owned(),
+                before: break_from(s["before"].as_str().unwrap_or(""))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let plan = Plan {
+        model: saved["model"]
+            .as_str()
+            .context("saved plan lacks model")?
+            .to_owned(),
+        body: saved["body"].clone(),
+        references: saved["references"].as_array().cloned().unwrap_or_default(),
+        budget: Budget {
+            chars: saved["budget"]["chars"]
+                .as_u64()
+                .context("saved plan lacks budget")? as usize,
+            source: "saved plan",
+        },
+        paragraph_pause: saved["paragraph_pause"]
+            .as_f64()
+            .context("saved plan lacks pause")?,
+        common: crate::generation::Common {
+            model: None,
+            output,
+            overwrite,
+            cache_dir: None,
+            offline: true,
+            dry_run: false,
+            take: saved["take"].as_str().map(str::to_owned),
+        },
+    };
+    if identity(&plan, &sections)? != id {
+        bail!("saved narration plan does not match job {id}");
+    }
+    execute(plan, sections)
+}
+
+fn execute(plan: Plan, planned: Vec<Section>) -> Result<Value> {
+    let id = identity(&plan, &planned)?;
     let Plan {
         model,
         body,
@@ -317,26 +403,95 @@ pub(crate) fn run(plan: Plan, text: &str) -> Result<Value> {
         paragraph_pause,
         common,
     } = plan;
-    let mut sections = split(text, budget.chars);
-    if !common.dry_run {
-        let output = common
-            .output
-            .as_deref()
-            .context("long narration is generated as several sections and joined; pass --output for the joined file")?;
+    let split_info = json!({
+        "sections":planned.len(),
+        "budget_chars":budget.chars,
+        "budget_source":budget.source,
+        "paragraph_pause_seconds":paragraph_pause,
+    });
+    if common.dry_run {
+        let mut previews = Vec::new();
+        for (i, section) in planned.iter().enumerate() {
+            let mut request = body.clone();
+            request["input"] = json!(section.text);
+            let preview = crate::generation::without_planned_identity(|| {
+                crate::generation::submit_audio(
+                    "speech-generation",
+                    model.clone(),
+                    request,
+                    references.clone(),
+                    section_common(&common, &model),
+                )
+            })?;
+            previews.push(json!({"index":i,"job_id":preview["id"],"chars":section.text.chars().count(),"break_before":section.before.name(),"first_words":first_words(&section.text)}));
+        }
+        return Ok(json!({
+            "dry_run":true,"id":id,"task":"speech-generation","model":model,"paid_request":false,
+            "references":references,"requests":planned.len(),"split":split_info,"sections":previews,
+            "note":"Long narration is one combined job made of section requests. Speech is usually billed by input length, so the total is close to one long request. Pricing comes from the selected model catalog/endpoint; this preview is not a quote."
+        }));
+    }
+    crate::generation::check_planned_identity(&id)?;
+    if let Some(output) = common.output.as_deref() {
         crate::generation::validate_audio_output(output, &references, common.overwrite)?;
     }
+    let saved = json!({
+        "version":1,"model":model,"body":body,"references":references,
+        "budget":{"chars":budget.chars,"source":budget.source},
+        "paragraph_pause":paragraph_pause,"take":common.take,
+        "sections":planned.iter().map(|s| json!({"text":s.text,"before":s.before.name()})).collect::<Vec<_>>(),
+    });
+    let mut template = body.clone();
+    template["input"] = json!(format!("<{} narration sections>", planned.len()));
+    let mut parent =
+        crate::generation::SplitJob::open(&id, &model, template, references.clone(), &saved)?;
+    if parent.status() != "completed" {
+        join_sections(
+            &mut parent,
+            &model,
+            &body,
+            &references,
+            &common,
+            planned,
+            paragraph_pause,
+            split_info,
+        )?;
+    }
+    if let Some(output) = common.output.as_deref() {
+        parent.publish(output, common.overwrite)?;
+    }
+    let mut out = parent.public()?;
+    if let Some(output) = common.output.as_deref() {
+        out["output"] = json!(output);
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_sections(
+    parent: &mut crate::generation::SplitJob,
+    model: &str,
+    body: &Value,
+    references: &[Value],
+    common: &crate::generation::Common,
+    mut sections: Vec<Section>,
+    paragraph_pause: f64,
+    mut split_info: Value,
+) -> Result<()> {
     let mut results: Vec<Value> = Vec::new();
     let mut index = 0;
     while index < sections.len() {
         let mut request = body.clone();
         request["input"] = json!(sections[index].text);
-        let outcome = crate::generation::submit_audio(
-            "speech-generation",
-            model.clone(),
-            request,
-            references.clone(),
-            section_common(&common, &model),
-        );
+        let outcome = crate::generation::without_planned_identity(|| {
+            crate::generation::submit_audio(
+                "speech-generation",
+                model.to_owned(),
+                request,
+                references.to_vec(),
+                section_common(common, model),
+            )
+        });
         let rejection = match &outcome {
             Err(error) => Some(format!("{error:#}")),
             Ok(value) if value["status"] == "rejected" => {
@@ -350,12 +505,14 @@ pub(crate) fn run(plan: Plan, text: &str) -> Result<Value> {
             let section = &sections[index];
             let chars = section.text.chars().count() / 2;
             if chars < MIN_CHARS {
-                bail!(
+                let error = format!(
                     "section {} of {} was rejected as too long even at {} characters: {message}",
                     index + 1,
                     sections.len(),
                     section.text.chars().count()
                 );
+                parent.block("rejected", error.clone())?;
+                bail!(error);
             }
             let mut smaller = split_paragraph(&section.text, chars)
                 .into_iter()
@@ -365,47 +522,42 @@ pub(crate) fn run(plan: Plan, text: &str) -> Result<Value> {
             sections.splice(index..=index, smaller);
             continue;
         }
-        let value = outcome.with_context(|| {
-            format!(
-                "narration section {} of {}; finished sections are kept, and rerunning the same command resumes without paying for them again",
-                index + 1,
-                sections.len()
-            )
-        })?;
-        if !common.dry_run && value["status"] != "completed" {
-            bail!(
-                "narration section {} of {} is {}: {}",
-                index + 1,
-                sections.len(),
-                value["status"].as_str().unwrap_or("unknown"),
-                value["error"].as_str().unwrap_or("no detail recorded")
-            );
-        }
-        results.push(value);
-        index += 1;
+        let (status, detail) = match &outcome {
+            Ok(value) if value["status"] == "completed" => {
+                results.push(value.clone());
+                index += 1;
+                continue;
+            }
+            Ok(value) => (
+                value["status"].as_str().unwrap_or("uncertain").to_owned(),
+                value["error"]
+                    .as_str()
+                    .unwrap_or("no detail recorded")
+                    .to_owned(),
+            ),
+            Err(error) => {
+                let text = format!("{error:#}");
+                let status = if text.contains("Submission rejected") {
+                    "rejected"
+                } else {
+                    "uncertain"
+                };
+                (status.to_owned(), text)
+            }
+        };
+        let error = format!(
+            "narration section {} of {} is {status}: {detail}. Finished sections are kept; once it is resolved, rerun the same command or `skywrite jobs resume JOB_ID` and only missing sections are requested",
+            index + 1,
+            sections.len()
+        );
+        let status = if matches!(status.as_str(), "rejected" | "failed") {
+            status
+        } else {
+            "uncertain".into()
+        };
+        parent.block(&status, error.clone())?;
+        bail!(error);
     }
-    let split_info = json!({
-        "sections":sections.len(),
-        "budget_chars":budget.chars,
-        "budget_source":budget.source,
-        "paragraph_pause_seconds":paragraph_pause,
-    });
-    if common.dry_run {
-        let previews: Vec<Value> = sections
-            .iter()
-            .zip(&results)
-            .enumerate()
-            .map(|(i, (s, r))| {
-                json!({"index":i,"id":r["id"],"chars":s.text.chars().count(),"break_before":s.before.name(),"first_words":first_words(&s.text)})
-            })
-            .collect();
-        return Ok(json!({
-            "dry_run":true,"task":"speech-generation","model":model,"paid_request":false,
-            "requests":sections.len(),"split":split_info,"sections":previews,
-            "note":"Each section is a separate request; speech is usually billed by input length, so the total is close to one long request. Pricing comes from the selected model catalog/endpoint; this preview is not a quote."
-        }));
-    }
-    let output = common.output.as_deref().unwrap();
     let temp = tempfile::tempdir()?;
     let pause_samples = (paragraph_pause * RATE as f64).round() as usize;
     let mut joined: Vec<u8> = Vec::new();
@@ -434,32 +586,34 @@ pub(crate) fn run(plan: Plan, text: &str) -> Result<Value> {
     }
     let raw = temp.path().join("joined.raw");
     std::fs::write(&raw, &joined)?;
-    let flac = temp.path().join("joined.flac");
+    let mp3 = temp.path().join("joined.mp3");
     let mut args = crate::process::args(&[
         "-v", "error", "-nostdin", "-y", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i",
     ]);
     args.push(raw.into_os_string());
-    args.push(flac.clone().into_os_string());
+    // LAME's gapless header lets FFmpeg decode back to exact section offsets.
+    args.extend(crate::process::args(&[
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "160k",
+    ]));
+    args.push(mp3.clone().into_os_string());
     crate::process::run("ffmpeg", &args, Duration::from_secs(600), 1024 * 1024)
         .context("joining narration sections")?;
-    crate::generation::publish_assembled_audio(&flac, output, &references, common.overwrite)?;
     let costs: Vec<Option<f64>> = results
         .iter()
         .map(|r| r["usage"]["cost"].as_f64())
         .collect();
-    let unknown = costs.iter().filter(|c| c.is_none()).count();
-    let usage = if unknown == 0 {
+    let usage = if costs.iter().all(Option::is_some) {
         json!({"cost":costs.iter().flatten().sum::<f64>(),"source":"sum of section generation metadata"})
     } else {
-        json!({"cost":null,"unknown_sections":unknown,"note":"Cost unknown, not zero, for some sections; run `skywrite jobs status JOB_ID --refresh` on their job IDs later."})
+        Value::Null
     };
-    Ok(json!({
-        "status":"completed","task":"speech-generation","model":model,
-        "output":output,"output_sha256":crate::media::file_sha256(output)?,
-        "duration_seconds":joined.len() as f64 / 2.0 / RATE as f64,
-        "split":split_info,"sections":timing,"usage":usage,
-        "resume":"Rerun the same command: finished sections replay from the job store without new paid requests.",
-    }))
+    split_info["sections"] = json!(timing);
+    split_info["requests"] = json!(sections.len());
+    split_info["duration_seconds"] = json!(joined.len() as f64 / 2.0 / RATE as f64);
+    parent.complete(&mp3, usage, split_info)
 }
 
 /// Decodes one section to 48 kHz mono PCM16 for sample-exact joining.
@@ -713,7 +867,7 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(result["status"], "completed", "{result}");
         assert!(output.is_file());
-        let sections = result["sections"].as_array().unwrap();
+        let sections = result["split"]["sections"].as_array().unwrap();
         assert_eq!(sections.len(), pieces + 2, "{result}");
         let at = |i: usize, key: &str| sections[i][key].as_f64().unwrap();
         // Paragraph seams get the pause; sentence seams inside a re-split paragraph do not.
@@ -723,8 +877,15 @@ mod tests {
         assert!((at(2, "start_seconds") - at(1, "end_seconds")).abs() < 1e-9);
         let last = sections.len() - 1;
         assert_eq!(sections[last]["break_before"], "paragraph");
-        assert!(
-            (result["duration_seconds"].as_f64().unwrap() - at(last, "end_seconds")).abs() < 1e-9
+        // The gapless MP3 artifact decodes back to the recorded total length.
+        let decoded = decode(
+            Path::new(result["artifact_path"].as_str().unwrap()),
+            &dir.path().join("check.raw"),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.len() as f64 / 2.0 / RATE as f64,
+            at(last, "end_seconds")
         );
         let posted = seen.lock().unwrap().clone();
         assert_eq!(posted.len(), pieces + 3);
@@ -732,13 +893,18 @@ mod tests {
             posted[1], long,
             "the rejected request carried the whole paragraph"
         );
-        // A rerun replays every section from the job store: no provider at all.
+        // lavfi sine is 1/8 amplitude (about -18 dBFS): measured, no warning.
+        let peak = result["artifact"]["levels"]["peak_dbfs"].as_f64().unwrap();
+        assert!((peak + 18.06).abs() < 0.6, "{peak}");
+        assert!(result["warnings"].is_null());
+        let id = result["id"].as_str().unwrap().to_owned();
+        // A rerun replays the combined job: no provider at all.
         let again = crate::generation::with_test_transport("http://127.0.0.1:9", || {
             run(plan(&output, true), &text)
         })
         .unwrap();
-        assert_eq!(again["sections"], result["sections"]);
-        assert_eq!(again["output_sha256"], result["output_sha256"]);
+        assert_eq!(again["id"], result["id"]);
+        assert_eq!(again["split"], result["split"]);
         // Without --overwrite the existing output is refused before any request.
         assert!(
             crate::generation::with_test_transport("http://127.0.0.1:9", || run(
@@ -747,5 +913,24 @@ mod tests {
             ))
             .is_err()
         );
+        // jobs status/resume treat the combined job like any other.
+        let status = crate::generation::execute_jobs(crate::generation::JobsCommand::Status {
+            id: id.clone(),
+            refresh: false,
+        })
+        .unwrap();
+        assert_eq!(status["status"], "completed");
+        let wav = dir.path().join("again.wav");
+        crate::generation::with_test_transport("http://127.0.0.1:9", || {
+            crate::generation::execute_jobs(crate::generation::JobsCommand::Resume {
+                id: id.clone(),
+                output: Some(wav.clone()),
+                overwrite: false,
+                wait: 0,
+                remote_id: None,
+            })
+        })
+        .unwrap();
+        assert!(wav.is_file());
     }
 }
