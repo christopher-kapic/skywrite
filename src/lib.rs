@@ -21,6 +21,7 @@ pub mod storage;
 
 pub mod audio_generation;
 pub mod config_cli;
+pub(crate) mod speech_split;
 
 pub mod public_access;
 pub mod timing;

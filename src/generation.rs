@@ -464,6 +464,19 @@ fn public_job(dir: &Path, job: &Job) -> Result<Value> {
         out["artifact_path"] = json!(artifact_path(dir, a)?);
     }
     out["resume"] = json!(format!("skywrite jobs resume {}", job.id));
+    if is_audio_task(&job.task)
+        && job.status == "completed"
+        && job.usage.as_ref().is_none_or(Value::is_null)
+    {
+        out["usage_note"] = json!(if job.generation_id.is_some() {
+            format!(
+                "Cost unknown, not zero: billing had not settled. Run `skywrite jobs status {} --refresh` later to fetch it.",
+                job.id
+            )
+        } else {
+            "Cost unknown, not zero: the provider returned no generation ID to look up. Check OpenRouter activity.".to_owned()
+        });
+    }
     Ok(out)
 }
 #[derive(Debug)]
@@ -1251,7 +1264,8 @@ fn submit_with_upload(
                     )
                 } else {
                     format!(
-                        "Submission outcome uncertain: {error:#}. Check OpenRouter activity; do not resubmit automatically. Adopt a known video ID with jobs resume --remote-id."
+                        "Submission outcome uncertain: {error:#}. {}",
+                        uncertain_advice(&job)
                     )
                 });
                 save_job(&dir, &mut job)?;
@@ -1269,7 +1283,10 @@ fn submit_with_upload(
     if job.status == "submitting" {
         recover_audio_generation_id(&dir, &mut job)?;
         job.status = "uncertain".into();
-        job.error=Some("Previous process stopped during submission. Check OpenRouter activity before intentionally creating a new take; adopt known video ID with jobs resume --remote-id.".into());
+        job.error = Some(format!(
+            "Previous process stopped during submission. {}",
+            uncertain_advice(&job)
+        ));
         save_job(&dir, &mut job)?;
     }
     if job.status == "received" {
@@ -1700,7 +1717,8 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 && is_audio_task(&job.task)
                 && job.usage.as_ref().is_none_or(Value::is_null)
                 && let Some(id) = &job.generation_id
-                && let Some(usage) = Transport::new()?.billing(id)?
+                // Unsettled billing is often a lookup error; keep the cost unknown.
+                && let Some(usage) = Transport::new()?.billing(id).ok().flatten()
             {
                 job.usage = Some(usage);
                 save_job(&dir, &mut job)?;
@@ -1728,7 +1746,8 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                     || !matches!(job.status.as_str(), "submitting" | "uncertain")
                 {
                     bail!(
-                        "provider ID adoption only allowed for uncertain video submits without known ID"
+                        "--remote-id adoption applies only to uncertain video submissions without a known provider ID; {} jobs return their result synchronously and cannot be adopted",
+                        job.task
                     );
                 }
                 job.remote_id = Some(id);
@@ -1753,7 +1772,10 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
             if is_synchronous_task(&job.task) && job.status == "submitting" {
                 recover_audio_generation_id(&dir, &mut job)?;
                 job.status = "uncertain".into();
-                job.error=Some("Previous process stopped during paid submission; check OpenRouter activity and do not blindly repeat it.".into());
+                job.error = Some(format!(
+                    "Previous process stopped during paid submission. {}",
+                    uncertain_advice(&job)
+                ));
                 save_job(&dir, &mut job)?;
             }
             if !is_synchronous_task(&job.task)
@@ -1762,6 +1784,19 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 refresh_video(&dir, &mut job, &Transport::new()?, wait)?;
             }
             cleanup_job_uploads(&dir, &mut job)?;
+            if matches!(job.status.as_str(), "uncertain" | "rejected" | "failed") {
+                bail!(
+                    "job {} is {} and has no result to resume{}: {}",
+                    job.id,
+                    job.status,
+                    if output.is_some() {
+                        "; nothing was written"
+                    } else {
+                        ""
+                    },
+                    job.error.as_deref().unwrap_or("no further detail recorded")
+                );
+            }
             if let Some(output) = output
                 && job.status == "completed"
             {
@@ -1962,6 +1997,21 @@ fn resize_image(input: &Path, output: &Path, factor: f64, overwrite: bool) -> Re
     )
 }
 
+/// Recovery advice after an uncertain paid submission, specific to the task:
+/// only video jobs have a provider job ID that can be adopted later.
+fn uncertain_advice(job: &Job) -> String {
+    if is_synchronous_task(&job.task) {
+        let activity = match &job.generation_id {
+            Some(id) => format!("Check OpenRouter activity for generation {id}"),
+            None => "Check OpenRouter activity".to_owned(),
+        };
+        format!(
+            "{activity}; this synchronous result cannot be retrieved later, so jobs resume cannot recover it. A new --take is a new paid request; do not resubmit automatically."
+        )
+    } else {
+        "Check OpenRouter activity; do not resubmit automatically. Adopt a known provider video ID with jobs resume --remote-id.".to_owned()
+    }
+}
 fn recover_audio_generation_id(dir: &Path, job: &mut Job) -> Result<()> {
     let headers = dir.join("audio-response-headers.json");
     if is_audio_task(&job.task) && job.generation_id.is_none() && headers.exists() {
@@ -2055,6 +2105,40 @@ fn complete_synchronous(dir: &Path, job: &mut Job, response: &Value) -> Result<(
     job.status = "completed".into();
     job.error = None;
     save_job(dir, job)
+}
+/// Output checks for audio a caller assembles itself (split narration), run
+/// before any paid request so a bad path cannot waste generated sections.
+pub(crate) fn validate_audio_output(
+    output: &Path,
+    references: &[Value],
+    overwrite: bool,
+) -> Result<()> {
+    validate_output(Some(output), references, overwrite)?;
+    let extension = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "mp3" | "wav") {
+        bail!("output extension does not match requested media kind");
+    }
+    Ok(())
+}
+/// Publish locally assembled audio with the same conversion and no-clobber rules
+/// as job artifacts. `source` must not already have the output's extension.
+pub(crate) fn publish_assembled_audio(
+    source: &Path,
+    output: &Path,
+    references: &[Value],
+    overwrite: bool,
+) -> Result<()> {
+    validate_audio_output(output, references, overwrite)?;
+    let extension = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    publish_audio(source, output, &extension, overwrite)
 }
 fn publish_audio(source: &Path, output: &Path, extension: &str, overwrite: bool) -> Result<()> {
     if !matches!(extension, "mp3" | "wav") {

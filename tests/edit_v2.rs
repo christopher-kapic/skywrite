@@ -470,3 +470,44 @@ fn roles_select_stems_and_label_interchange() {
     assert!(text.contains("audioRole=\"music\""), "{text}");
     assert!(text.contains("audioRole=\"dialogue\""), "{text}");
 }
+
+#[test]
+fn subframe_source_end_rounding_is_padded_not_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1.456 s ends 0.4 of a frame into frame 44 at 30 fps; nearest-frame
+    // rounding yields 1.466667 s, a 0.010667 s tail past the source.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=1.456",
+        dir.path().join("voice.wav").to_str().unwrap(),
+    ]);
+    let edit = |duration: f64| {
+        base(
+            json!([]),
+            json!([{"clips":[{"start":0,"source":"voice.wav","source_in":0,"duration":duration}]}]),
+        )
+    };
+    let validated = timeline::validate(&timeline::parse(edit(1.456)).unwrap(), dir.path()).unwrap();
+    let summary = validated.summary();
+    assert!(
+        summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("past the source end")),
+        "{summary}"
+    );
+    let output = dir.path().join("padded.mp4");
+    export::render(&validated, &output, false).unwrap();
+    // A whole extra frame is a real overrun, not rounding.
+    let error = timeline::validate(&timeline::parse(edit(1.5)).unwrap(), dir.path())
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("beyond"), "{error:#}");
+}

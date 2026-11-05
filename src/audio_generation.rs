@@ -12,7 +12,8 @@ pub(crate) const MAX_AUDIO: usize = 32 * 1024 * 1024;
 const MAX_WIRE: usize = 64 * 1024 * 1024;
 #[derive(Debug, Args)]
 pub struct SpeechArgs {
-    /// Exact narration text, at most 8192 UTF-8 bytes.
+    /// Exact narration text, at most 64 KiB. Text longer than one request for the
+    /// selected model is split at paragraph breaks and joined into one output.
     #[arg(long, required_unless_present = "file", conflicts_with = "file")]
     pub text: Option<String>,
     /// UTF-8 script, protected from output overwrite.
@@ -27,6 +28,13 @@ pub struct SpeechArgs {
     /// Speaking speed, only for documented compatible adapters.
     #[arg(long)]
     pub speed: Option<f64>,
+    /// Seconds of silence added between split sections at paragraph breaks (0-5).
+    /// Only applies when the script is too long for one request.
+    #[arg(long, default_value_t = 0.3)]
+    pub paragraph_pause: f64,
+    /// Project nodes record one job each, so they must fit one request.
+    #[arg(skip)]
+    pub single_request: bool,
     #[command(flatten)]
     pub common: crate::generation::Common,
 }
@@ -52,7 +60,8 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
     let mut refs = Vec::new();
     let text = if let Some(path) = &args.file {
         let path = crate::media::canonical_file(path)?;
-        let bytes = crate::generation::read_bounded_file(&path, 8192)?;
+        let bytes =
+            crate::generation::read_bounded_file(&path, crate::speech_split::MAX_SCRIPT_BYTES)?;
         let hash = crate::generation::bytes_sha256(&bytes);
         let text = String::from_utf8(bytes).context("narration script must be UTF-8")?;
         refs.push(json!({"path":path,"sha256":hash,"kind":"narration-script"}));
@@ -60,7 +69,14 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
     } else {
         args.text.context("provide --text or --file")?
     };
-    text_check(&text, 8192, "narration text")?;
+    text_check(
+        &text,
+        crate::speech_split::MAX_SCRIPT_BYTES,
+        "narration text",
+    )?;
+    if !args.paragraph_pause.is_finite() || !(0.0..=5.0).contains(&args.paragraph_pause) {
+        bail!("--paragraph-pause must be between 0 and 5 seconds");
+    }
     if let Some(v) = &args.instructions {
         text_check(v, 4096, "delivery instructions")?;
     }
@@ -100,8 +116,14 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
             bail!("speed control is not documented for this speech adapter; omit --speed");
         }
     }
-    if model == "bytedance-seed/seed-audio-1-0" && text.chars().count() > 3000 {
-        bail!("Seed Audio input is limited to 3000 characters");
+    let budget = crate::speech_split::budget(&model, &caps);
+    let split = crate::speech_split::needs_split(&text, budget.chars);
+    if split && args.single_request {
+        bail!(
+            "speech node text exceeds one request for {model} ({} characters, from {}); split it into several speech nodes at paragraph breaks",
+            budget.chars,
+            budget.source
+        );
     }
     let mut body = json!({"model":model,"input":text,"response_format":"mp3"});
     if let Some(v) = args.voice {
@@ -112,6 +134,19 @@ pub fn speech(args: SpeechArgs) -> Result<Value> {
     }
     if let Some(v) = args.speed {
         body["speed"] = json!(v);
+    }
+    if split {
+        return crate::speech_split::run(
+            crate::speech_split::Plan {
+                model,
+                body,
+                references: refs,
+                budget,
+                paragraph_pause: args.paragraph_pause,
+                common: args.common,
+            },
+            &text,
+        );
     }
     crate::generation::submit_audio("speech-generation", model, body, refs, args.common)
 }
@@ -241,7 +276,15 @@ pub(crate) fn parse_music_stream(reader: impl Read) -> Result<Value> {
         }
     }
     if !done || audio.is_empty() {
-        bail!("music stream ended without complete audio; do not automatically resubmit");
+        bail!(
+            "music stream ended without complete audio ({} audio bytes received, {}); do not automatically resubmit",
+            audio.len(),
+            if done {
+                "terminator seen"
+            } else {
+                "no [DONE] terminator"
+            }
+        );
     }
     Ok(
         json!({"audio":{"data":STANDARD.encode(audio)},"text":text,"usage":usage,"generation_id":generation_id}),

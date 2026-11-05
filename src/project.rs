@@ -713,6 +713,8 @@ fn command(
             voice: voice.clone(),
             instructions: instructions.clone(),
             speed: *speed,
+            paragraph_pause: 0.3,
+            single_request: true,
             common,
         }),
         Action::Music {

@@ -775,7 +775,15 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
                     ));
                 }
             } else {
-                check_range(clip.source_in, duration, clip.speed, &info, &label)?;
+                check_range(
+                    clip.source_in,
+                    duration,
+                    clip.speed,
+                    edit.fps,
+                    &info,
+                    &label,
+                    &mut warnings,
+                )?;
                 if !info.has_audio() && clip.audio != Mix::default() && clip.audio.volume > 0.0 {
                     warnings.push(format!(
                         "{label}: source has no audio stream; its audio settings have no effect"
@@ -855,7 +863,15 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
                 "{label}: {} has no audio stream",
                 path.display()
             );
-            check_range(clip.source_in, duration, clip.speed, &info, &label)?;
+            check_range(
+                clip.source_in,
+                duration,
+                clip.speed,
+                edit.fps,
+                &info,
+                &label,
+                &mut warnings,
+            )?;
             used_sources.insert(path.clone());
             clips.push(ValidatedAudioClip {
                 track: track_index,
@@ -1494,23 +1510,35 @@ fn probe_cached(
     cache.insert(path.to_owned(), info.clone());
     Ok(info)
 }
+/// Nearest-frame rounding may lengthen a clip by up to half an output frame.
+/// That tail past the source end is accepted and padded by renderers (silence,
+/// held last picture); anything longer is a real out-of-range trim.
 fn check_range(
     start: f64,
     duration: f64,
     speed: f64,
+    fps: Rational,
     info: &media::MediaInfo,
     label: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
     if !info.duration.is_finite() || info.duration <= 0.0 {
         bail!("{label}: source does not have a known positive duration");
     }
     let end = start + duration * speed;
+    let rounding = fps.seconds(1) * speed / 2.0;
     ensure!(
-        end.is_finite() && end <= info.duration + 0.002,
+        end.is_finite() && end <= info.duration + rounding + 0.002,
         "{label}: source range ends at {end:.6}s, beyond {} duration {:.6}s",
         info.path.display(),
         info.duration
     );
+    if end > info.duration + 0.002 {
+        warnings.push(format!(
+            "{label}: frame-rounded duration runs {:.6}s past the source end; the tail is padded (silence, held last frame)",
+            end - info.duration
+        ));
+    }
     Ok(())
 }
 fn is_still(info: &media::MediaInfo) -> bool {

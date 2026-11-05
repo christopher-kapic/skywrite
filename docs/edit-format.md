@@ -67,7 +67,10 @@ conform that asset to the reference. Source trims are not timeline positions.
 
 `start`, `duration` and the optional timeline `duration` are rounded to the
 nearest output frame, and the validator reports rounding. `source_in` keeps its
-precision (word-accurate dialogue cuts). Use rational rates such as
+precision (word-accurate dialogue cuts). Because rounding is to the nearest
+frame, a clip that uses a source to its very end may run up to half an output
+frame past it; that tail is accepted with a warning and padded (silence, held
+last picture), so durations need not be floored. Longer overruns are rejected. Use rational rates such as
 `{"num":30000,"den":1001}` for NTSC.
 
 ## Pictures
